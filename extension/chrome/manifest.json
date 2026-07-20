@@ -1,0 +1,25 @@
+{
+    "manifest_version": 3,
+    "name": "Monet AI Detector",
+    "version": "1.0",
+    "description": "Detect AI-generated video content",
+    "permissions": [
+        "activeTab"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "css": [
+                "styles.css"
+            ]
+        }
+    ]
+}

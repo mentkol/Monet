@@ -1,0 +1,118 @@
+/* Neon Border Container */
+.monet-neon-border {
+    position: fixed !important;
+    pointer-events: none !important;
+    z-index: 2147483647 !important;
+    border: 3px solid transparent !important;
+    border-radius: 12px !important;
+    box-shadow: 0 0 10px currentColor !important;
+    transition: all 0.3s ease !important;
+}
+
+/* Analyzing State - Purple Pulse */
+.monet-analyzing {
+    border-color: #a855f7 !important;
+    box-shadow: 0 0 20px #a855f7,
+        0 0 40px #a855f7,
+        0 0 60px #a855f7 !important;
+    animation: pulse-purple 1.5s ease-in-out infinite !important;
+}
+
+@keyframes pulse-purple {
+
+    0%,
+    100% {
+        box-shadow: 0 0 20px #a855f7, 0 0 40px #a855f7 !important;
+        opacity: 0.8;
+    }
+
+    50% {
+        box-shadow: 0 0 30px #a855f7, 0 0 60px #a855f7, 0 0 90px #a855f7 !important;
+        opacity: 1;
+    }
+}
+
+/* Real/Authentic - Green Glow */
+.monet-real {
+    border-color: #22c55e !important;
+    box-shadow: 0 0 20px #22c55e,
+        0 0 40px #22c55e,
+        inset 0 0 20px rgba(34, 197, 94, 0.1) !important;
+    animation: glow-green 2s ease-in-out infinite !important;
+}
+
+@keyframes glow-green {
+
+    0%,
+    100% {
+        box-shadow: 0 0 20px #22c55e, 0 0 40px #22c55e !important;
+    }
+
+    50% {
+        box-shadow: 0 0 30px #22c55e, 0 0 60px #22c55e !important;
+    }
+}
+
+/* AI Generated - Red Alert */
+.monet-ai {
+    border-color: #ef4444 !important;
+    box-shadow: 0 0 20px #ef4444,
+        0 0 40px #ef4444,
+        0 0 80px #ef4444,
+        inset 0 0 20px rgba(239, 68, 68, 0.2) !important;
+    animation: pulse-red 1s ease-in-out infinite !important;
+}
+
+@keyframes pulse-red {
+
+    0%,
+    100% {
+        box-shadow: 0 0 20px #ef4444, 0 0 40px #ef4444 !important;
+    }
+
+    50% {
+        box-shadow: 0 0 40px #ef4444, 0 0 80px #ef4444, 0 0 120px #ef4444 !important;
+    }
+}
+
+/* Suspicious - Yellow/Orange Warning */
+.monet-suspicious {
+    border-color: #f59e0b !important;
+    box-shadow: 0 0 20px #f59e0b,
+        0 0 40px #f59e0b !important;
+    animation: glow-yellow 2s ease-in-out infinite !important;
+}
+
+@keyframes glow-yellow {
+
+    0%,
+    100% {
+        box-shadow: 0 0 20px #f59e0b, 0 0 40px #f59e0b !important;
+    }
+
+    50% {
+        box-shadow: 0 0 30px #f59e0b, 0 0 60px #f59e0b !important;
+    }
+}
+
+/* Score Label */
+.monet-score-label {
+    position: absolute !important;
+    top: -35px !important;
+    right: 0 !important;
+    background: rgba(0, 0, 0, 0.9) !important;
+    color: white !important;
+    padding: 6px 12px !important;
+    border-radius: 20px !important;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    border: 2px solid currentColor !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Platform-specific adjustments */
+/* YouTube Shorts remove default radius */
+[data-monet-watched] {
+    border-radius: 12px !important;
+}
