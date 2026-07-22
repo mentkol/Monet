@@ -6,49 +6,6 @@ const Monet = {
     videoResults: new Map(),  // video element -> { src, score, reason, borderId }
     lastUrl: location.href,   // Track URL for SPA navigation
     reconnectTimer: null,
-    feedbackTaxonomy: {
-        real: {
-            label: "Real",
-            types: [
-                ["real_human", "Human / vlog"],
-                ["real_animal", "Animal / pet"],
-                ["real_nature", "Nature / travel"],
-                ["real_vehicle", "Cars / vehicles"],
-                ["real_sports", "Sports / action"],
-                ["real_food_product", "Food / product"],
-                ["real_news_event", "News / event"],
-                ["real_screen_game", "Screen / gaming"],
-                ["real_animation_vfx", "Animation / VFX"],
-                ["real_other", "Other real"]
-            ]
-        },
-        suspicious: {
-            label: "Suspicious",
-            types: [
-                ["suspicious_filter", "Heavy filter"],
-                ["suspicious_vfx", "VFX / CGI"],
-                ["suspicious_vehicle", "Vehicle edit / CGI"],
-                ["suspicious_deepfake", "Deepfake / face swap"],
-                ["suspicious_mixed", "Mixed AI + real"],
-                ["suspicious_low_quality", "Low quality / repost"],
-                ["suspicious_unsure", "Unsure"]
-            ]
-        },
-        ai: {
-            label: "AI",
-            types: [
-                ["ai_human", "AI human"],
-                ["ai_animal", "AI animal"],
-                ["ai_nature", "AI scene / nature"],
-                ["ai_vehicle", "AI car / vehicle"],
-                ["ai_object", "AI object / product"],
-                ["ai_animation", "AI animation / CGI"],
-                ["ai_text_caption", "AI text / caption"],
-                ["ai_story_meme", "AI story / meme"],
-                ["ai_other", "Other AI"]
-            ]
-        }
-    },
 
     init() {
         this.addStyles();
@@ -90,14 +47,6 @@ const Monet = {
         this.socket.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-
-                if (data.type === "feedback_saved") {
-                    const border = this.borders.get(data.videoId);
-                    const label = border?.parentElement?.querySelector('.monet-label');
-                    const status = label?.querySelector('.monet-feedback-status');
-                    if (status) status.textContent = 'Saved';
-                    return;
-                }
 
                 if (!data.videoId || data.ai_score === undefined) {
                     console.warn("🎨 Invalid response:", data);
@@ -223,41 +172,6 @@ const Monet = {
       .monet-breakdown-title { font-weight: 600; color: white; letter-spacing: 0.2px; }
       .monet-breakdown-val { font-weight: 600; font-family: monospace; font-size: 13.5px; }
       .monet-breakdown-header { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: white; margin-bottom: 10px; font-weight: 700; }
-      .monet-feedback {
-          display: block;
-          margin-top: 12px;
-      }
-      .monet-feedback-major, .monet-feedback-types {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          flex-wrap: wrap;
-      }
-      .monet-feedback-types {
-          display: none;
-          margin-top: 8px;
-      }
-      .monet-feedback-type-group {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          flex-wrap: wrap;
-      }
-      .monet-feedback[data-step="types"] .monet-feedback-major { display: none; }
-      .monet-feedback[data-step="types"] .monet-feedback-types { display: flex; }
-      .monet-feedback button {
-          border: 1px solid rgba(255,255,255,0.18);
-          background: rgba(255,255,255,0.12);
-          color: white;
-          border-radius: 8px;
-          padding: 5px 8px;
-          font-size: 12px;
-          font-weight: 700;
-          cursor: pointer;
-      }
-      .monet-feedback button[data-monet-back] { opacity: 0.75; }
-      .monet-feedback button:hover { background: rgba(255,255,255,0.22); }
-      .monet-feedback-status { display: block; margin-top: 7px; font-size: 11px; opacity: 0.8; }
     `;
         document.head.appendChild(style);
     },
@@ -411,19 +325,21 @@ const Monet = {
         const candidates = Array.from(document.querySelectorAll(
             '[aria-label], [title], button, yt-formatted-string, span, div'
         ));
-        const aiPhrases = [
+        // Only treat explicit disclosure phrases as evidence. Previously a
+        // bare "AI" / "synthetic" / "altered" exact match (isPillText) fired
+        // on random UI elements (menus, tooltips, suggestions, "how this
+        // content was made" links), flagging EVERY video as 100% AI without
+        // ever sending frames to the server.
+        const DISCLOSURE_PHRASES = [
             'altered or synthetic content',
+            'altered content',
             'synthetic content',
+            'synthetic media',
             'ai-generated',
             'ai generated',
             'created with ai',
             'made with ai',
-            'generated with ai',
-            'about altered',
-            'about synthetic',
-            'altered content',
-            'synthetic media',
-            'how this content was made'
+            'generated with ai'
         ];
 
         for (const element of candidates) {
@@ -448,81 +364,17 @@ const Monet = {
                 element.textContent || ''
             ].join(' ').replace(/\s+/g, ' ').trim();
 
-            if (!text || text.length > 220) continue;
+            // Disclosure copy is short — skip long blobs (descriptions, transcripts).
+            if (!text || text.length > 120) continue;
 
             const lower = text.toLowerCase();
-            
-            // Check for direct match of "(i) AI" or "AI" in a pill/button
-            const isPillText = /^(\(?i\)?\s*)?ai$/i.test(lower.trim()) || lower.trim() === 'synthetic' || lower.trim() === 'altered';
-            
-            const hasAiMarker = /\bai\b|synthetic|altered/.test(lower);
-            const matchesPhrase = aiPhrases.some(phrase => lower.includes(phrase));
 
-            if (isPillText || (hasAiMarker && matchesPhrase)) {
+            if (DISCLOSURE_PHRASES.some(phrase => lower.includes(phrase))) {
                 return text;
             }
         }
 
         return '';
-    },
-
-    sendFeedback(videoId, correction, contentType, contentLabel) {
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            this.connect();
-            return;
-        }
-
-        let payload = null;
-        for (const [video, info] of this.videoResults.entries()) {
-            if (info.borderId === videoId) {
-                payload = {
-                    type: "feedback",
-                    videoId,
-                    correction,
-                    contentType,
-                    contentLabel,
-                    score: info.score,
-                    label: info.label,
-                    confidence: info.confidence,
-                    reason: info.reason,
-                    breakdown: info.data?.breakdown || {},
-                    src: info.src,
-                    url: location.href,
-                    metadata: info.metadata || this.collectMetadata()
-                };
-                break;
-            }
-        }
-
-        if (payload) {
-            this.socket.send(JSON.stringify(payload));
-        }
-    },
-
-    buildFeedbackHtml() {
-        const majorButtons = Object.entries(this.feedbackTaxonomy)
-            .map(([key, group]) => `<button type="button" data-monet-feedback-major="${key}">${group.label}</button>`)
-            .join('');
-
-        const typeGroups = Object.entries(this.feedbackTaxonomy)
-            .map(([key, group]) => {
-                const buttons = group.types
-                    .map(([type, label]) => `<button type="button" data-monet-feedback-type="${type}" data-monet-feedback="${key}" data-monet-feedback-label="${label}">${label}</button>`)
-                    .join('');
-                return `<div class="monet-feedback-type-group" data-monet-feedback-group="${key}" style="display:none;">
-                    <button type="button" data-monet-back>Back</button>
-                    ${buttons}
-                </div>`;
-            })
-            .join('');
-
-        return `
-            <div class="monet-feedback" data-step="major">
-                <div class="monet-feedback-major">${majorButtons}</div>
-                <div class="monet-feedback-types">${typeGroups}</div>
-                <span class="monet-feedback-status"></span>
-            </div>
-        `;
     },
 
     _createBorderElement(id, container) {
@@ -660,16 +512,16 @@ const Monet = {
 
         // Capture a wider slice of the Short so temporal artifacts have a chance to show up.
         const frames = [];
-        const frameCount = 12;
+        const frameCount = 8;
         const frameDelayMs = 600;
         for (let i = 0; i < frameCount; i++) {
             if (i > 0) await new Promise(r => setTimeout(r, frameDelayMs));
             if (!video.isConnected) break;
             const c = document.createElement('canvas');
-            c.width = 360;
-            c.height = 640;
-            c.getContext('2d').drawImage(video, 0, 0, 360, 640);
-            frames.push(c.toDataURL('image/jpeg', 0.72));
+            c.width = 480;
+            c.height = 854;
+            c.getContext('2d').drawImage(video, 0, 0, 480, 854);
+            frames.push(c.toDataURL('image/jpeg', 0.85));
         }
 
         if (frames.length < 4) {
@@ -768,10 +620,9 @@ const Monet = {
         const formatKeyName = (key) => {
             const dictionary = {
                 'texture_smoothness': 'Texture Smoothness',
-                'biometric': 'Biometrics',
                 'color': 'Color Variance',
                 'semantic': 'Semantics',
-                'vit': 'ViT Model',
+                'ai_detector': 'AI Detector',
                 'metadata': 'Metadata / YouTube AI Label',
                 'digital_penalty': 'Digital Media Penalty'
             };
@@ -804,7 +655,6 @@ const Monet = {
                 <span class="monet-breakdown-title">Confidence</span>
                 <span class="monet-breakdown-val" style="font-family: inherit; color: ${confValColor}">${confidence}</span>
             </div>
-            ${this.buildFeedbackHtml()}
         `;
 
         const infoSvg = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="monet-info-icon"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>`;
@@ -846,50 +696,6 @@ const Monet = {
                 }
             });
         }
-
-        const feedback = label.querySelector('.monet-feedback');
-
-        label.querySelectorAll('[data-monet-feedback-major]').forEach(button => {
-            button.addEventListener('click', event => {
-                event.preventDefault();
-                event.stopPropagation();
-                const selected = button.dataset.monetFeedbackMajor;
-                if (!feedback) return;
-                feedback.dataset.step = 'types';
-                feedback.querySelectorAll('[data-monet-feedback-group]').forEach(group => {
-                    group.style.display = group.dataset.monetFeedbackGroup === selected ? 'flex' : 'none';
-                });
-                const status = feedback.querySelector('.monet-feedback-status');
-                if (status) status.textContent = 'Choose content type';
-            });
-        });
-
-        label.querySelectorAll('[data-monet-back]').forEach(button => {
-            button.addEventListener('click', event => {
-                event.preventDefault();
-                event.stopPropagation();
-                if (!feedback) return;
-                feedback.dataset.step = 'major';
-                feedback.querySelectorAll('[data-monet-feedback-group]').forEach(group => {
-                    group.style.display = 'none';
-                });
-                const status = feedback.querySelector('.monet-feedback-status');
-                if (status) status.textContent = '';
-            });
-        });
-
-        label.querySelectorAll('[data-monet-feedback-type]').forEach(button => {
-            button.addEventListener('click', event => {
-                event.preventDefault();
-                event.stopPropagation();
-                const correction = button.dataset.monetFeedback;
-                const contentType = button.dataset.monetFeedbackType;
-                const contentLabel = button.dataset.monetFeedbackLabel;
-                const status = label.querySelector('.monet-feedback-status');
-                if (status) status.textContent = 'Saving...';
-                this.sendFeedback(border.id, correction, contentType, contentLabel);
-            });
-        });
     }
 };
 

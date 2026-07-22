@@ -2,9 +2,7 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import warnings
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -29,14 +27,19 @@ LABELS = {
 
 FEATURE_NAMES = [
     'texture_mean', 'texture_max', 'texture_std',
-    'bio_mean', 'bio_max', 'bio_std',
     'color_mean', 'color_max', 'color_std',
     'digital_penalty',
     'semantic',
     'vit_mean', 'vit_max', 'vit_std',
     'metadata_score',
-    'metadata_hits'
+    'metadata_hits',
+    'temporal_diff_mean', 'temporal_diff_std',
+    'brightness_flicker', 'saturation_flicker',
 ]
+
+# Cache schema version. Bumped when frame sampling / resolution changes so
+# stale cached features are recomputed instead of reused.
+CACHE_VERSION = "8frame_480p_temporal4"
 
 
 def score_to_class(score, ai_threshold=0.58, suspicious_threshold=0.32):
@@ -47,31 +50,27 @@ def score_to_class(score, ai_threshold=0.58, suspicious_threshold=0.32):
     return 0
 
 
-def read_urls(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
-
-
 def load_sources(base_dir, limit_per_class=None):
+    """Load evaluation examples from the local 480p video folders."""
     sources = [
-        ("urls_real.txt", 0, "real"),
-        ("urls_suspicious.txt", 1, "suspicious"),
-        ("urls_fake.txt", 2, "ai"),
+        ("urls_real", 0, "real"),
+        ("urls_suspicious", 1, "suspicious"),
+        ("urls_fake", 2, "ai"),
     ]
     examples = []
-    for filename, label, bucket in sources:
-        path = os.path.join(base_dir, "training_data", filename)
-        if not os.path.exists(path):
-            continue
-        urls = read_urls(path)
+    for folder_name, label, bucket in sources:
+        folder = os.path.join(base_dir, "training_data", folder_name)
+        video_files = _iter_video_files(folder)
         if limit_per_class:
-            urls = urls[:limit_per_class]
-        for url in urls:
+            video_files = video_files[:limit_per_class]
+        for path in video_files:
+            video_id = os.path.splitext(os.path.basename(path))[0]
             examples.append({
-                "url": url,
+                "url": _url_from_video_id(video_id),
+                "video_path": path,
                 "label": label,
                 "bucket": bucket,
-                "source": filename,
+                "source": folder_name + "/",
             })
     return examples
 
@@ -103,6 +102,29 @@ def _analyze_color(frames):
         else:
             scores.append(0.1)
     return scores
+
+
+def _compute_temporal_features(frames):
+    """Frame-to-frame consistency features (must match train_model.py / server.py)."""
+    import cv2
+
+    if len(frames) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    diffs, brights, sats = [], [], []
+    for i, f in enumerate(frames):
+        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        brights.append(float(np.mean(gray)) / 255.0)
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        sats.append(float(np.mean(hsv[:, :, 1])) / 255.0)
+        if i > 0:
+            d = cv2.absdiff(f, frames[i - 1])
+            diffs.append(float(np.mean(d)) / 255.0)
+    return (
+        float(np.mean(diffs)),
+        float(np.std(diffs)),
+        float(np.std(brights)),
+        float(np.std(sats)),
+    )
 
 
 def _analyze_metadata(metadata):
@@ -169,116 +191,79 @@ def _analyze_metadata(metadata):
     return min(score, 0.85), hit_count / 6
 
 
-def _fetch_metadata(url):
-    try:
-        cmd = ["yt-dlp", "--dump-json", "--skip-download", url]
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        raw = json.loads(result.stdout)
-        return {
-            "title": raw.get("title", ""),
-            "description": raw.get("description", ""),
-            "channel": raw.get("channel", "") or raw.get("uploader", ""),
-            "tags": raw.get("tags", []) or [],
-            "categories": raw.get("categories", []) or []
-        }
-    except Exception:
-        return {}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".flv"}
 
 
-def load_feedback(base_dir):
-    path = os.path.join(base_dir, "training_data", "feedback.jsonl")
-    if not os.path.exists(path):
+def _is_video_file(path):
+    return os.path.isfile(path) and os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def _iter_video_files(folder):
+    if not os.path.isdir(folder):
         return []
-
-    examples = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            correction = (row.get("correction") or "").lower()
-            url = row.get("url")
-            if correction not in {"real", "suspicious", "ai"} or not url:
-                continue
-            label = {"real": 0, "suspicious": 1, "ai": 2}[correction]
-            content_type = row.get("content_type") or "feedback_uncategorized"
-            examples.append({
-                "url": url,
-                "label": label,
-                "bucket": f"feedback_{content_type}",
-                "source": "feedback.jsonl",
-                "feedback": row,
-            })
-    return examples
+    entries = sorted(os.listdir(folder))
+    return [os.path.join(folder, name) for name in entries if _is_video_file(os.path.join(folder, name))]
 
 
-def download_frames(url, frame_count=12):
+def _url_from_video_id(video_id):
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _sample_frames(video_path, num_sample=8):
+    """Sample up to `num_sample` frames evenly across the whole video (matches train_model.py)."""
     import cv2
 
-    fd, temp_path = tempfile.mkstemp(prefix="monet_eval_", suffix=".mp4")
-    os.close(fd)
-
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
     try:
-        cmd = ["yt-dlp", "-f", "best[ext=mp4]", "-o", temp_path, "--force-overwrites", url]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-        cap = cv2.VideoCapture(temp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-
         frames = []
         if total_frames > 0:
-            indices = [min(total_frames - 1, int(round(i * 0.5 * fps))) for i in range(min(frame_count, total_frames))]
+            count = min(num_sample, total_frames)
+            indices = np.linspace(0, total_frames - 1, count, dtype=int)
+            indices = list(dict.fromkeys(int(i) for i in indices))
             for idx in indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ok, frame = cap.read()
                 if ok:
                     frames.append(frame)
-        cap.release()
         return frames
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        cap.release()
 
 
 class FeatureExtractor:
     def __init__(self):
         from analyzers.texture import TextureAnalyzer
-        from analyzers.biometrics import BiometricAnalyzer
         from analyzers.semantics import SemanticAnalyzer
         from analyzers.random_forest import RandomForestClassifier
-        from analyzers.vit_detector import ViTDetector
+        from analyzers.siglip_dinov2_detector import SigLIPDinoV2Detector
 
         print("Initializing analyzers...")
         self.texture = TextureAnalyzer()
-        self.biometrics = BiometricAnalyzer()
         self.semantics = SemanticAnalyzer()
-        self.vit = ViTDetector()
+        self.vit = SigLIPDinoV2Detector()
         self.rf = RandomForestClassifier()
         self.feature_names = RandomForestClassifier.FEATURE_NAMES
 
-    async def extract(self, url):
-        metadata = _fetch_metadata(url)
-        frames = download_frames(url)
+    async def extract(self, example):
+        metadata = {}
+        frames = _sample_frames(example["video_path"])
         if not frames:
             raise RuntimeError("No frames extracted")
 
         texture_scores = [self.texture.analyze(frame)[0] for frame in frames]
-        bio_scores = []
-        for frame in frames:
-            score, _ = await self.biometrics.analyze(frame)
-            bio_scores.append(score)
-
         color_scores = _analyze_color(frames)
         semantic_score, _ = await self.semantics.analyze(frames)
         vit_mean, vit_max, vit_std, _ = self.vit.analyze_frame_stats(frames)
         metadata_score, metadata_hits = _analyze_metadata(metadata)
         digital_penalty = _detect_digital_content(frames[0])
 
+        temporal_diff_mean, temporal_diff_std, brightness_flicker, saturation_flicker = _compute_temporal_features(frames)
+
         features = self.rf.extract_features(
             np.mean(texture_scores), np.max(texture_scores), np.std(texture_scores),
-            np.mean(bio_scores), np.max(bio_scores), np.std(bio_scores),
             np.mean(color_scores), np.max(color_scores), np.std(color_scores),
             digital_penalty,
             semantic_score,
@@ -288,6 +273,10 @@ class FeatureExtractor:
             vit_mean=vit_mean,
             vit_max=vit_max,
             vit_std=vit_std,
+            temporal_diff_mean=temporal_diff_mean,
+            temporal_diff_std=temporal_diff_std,
+            brightness_flicker=brightness_flicker,
+            saturation_flicker=saturation_flicker,
         )[0]
 
         return {
@@ -472,9 +461,8 @@ def write_report(path, rows, sweep, feature_importance):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Evaluate Monet on labeled Shorts URLs.")
-    parser.add_argument("--limit-per-class", type=int, default=None, help="Quick-run limit for each URL list.")
-    parser.add_argument("--include-feedback", action="store_true", help="Include saved Real/AI feedback corrections.")
+    parser = argparse.ArgumentParser(description="Evaluate Monet on local labeled videos.")
+    parser.add_argument("--limit-per-class", type=int, default=None, help="Quick-run limit for each class.")
     parser.add_argument("--cache", default=None, help="Feature cache JSONL path.")
     parser.add_argument("--report", default=None, help="Markdown report output path.")
     args = parser.parse_args()
@@ -487,8 +475,6 @@ async def main():
     model_path = os.path.join(base_dir, "analyzers", "random_forest.pkl")
 
     examples = load_sources(base_dir, args.limit_per_class)
-    if args.include_feedback:
-        examples.extend(load_feedback(base_dir))
 
     if not examples:
         print("No examples found.")
@@ -504,11 +490,11 @@ async def main():
         print(f"[{idx}/{len(examples)}] {url}")
         try:
             cached = cache.get(url)
-            if cached and len(cached.get("features", [])) == len(FEATURE_NAMES):
+            if cached and cached.get("v") == CACHE_VERSION and len(cached.get("features", [])) == len(FEATURE_NAMES):
                 feature_row = cached
             else:
-                feature_row = await extractor.extract(url)
-                feature_row.update({"url": url})
+                feature_row = await extractor.extract(example)
+                feature_row.update({"url": url, "v": CACHE_VERSION})
                 append_cache(cache_path, feature_row)
 
             features = np.array([feature_row["features"]])

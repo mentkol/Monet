@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from typing import Tuple, List, Optional
@@ -7,14 +8,19 @@ class SemanticAnalyzer:
     def __init__(self):
         print("Loading semantic analyzer...")
         
+        # OCR (Tesseract) is disabled by default: it adds ~0.3s/video for
+        # marginal signal. Re-enable by setting MONET_OCR=1.
         self.ocr_available = False
-        try:
-            import pytesseract
-            pytesseract.get_tesseract_version()
-            self.ocr_available = True
-            print("  OCR: Tesseract available")
-        except:
-            print("  OCR: Tesseract not available (text detection limited)")
+        if os.environ.get("MONET_OCR", "0") == "1":
+            try:
+                import pytesseract
+                pytesseract.get_tesseract_version()
+                self.ocr_available = True
+                print("  OCR: Tesseract available")
+            except:
+                print("  OCR: Tesseract not available (text detection limited)")
+        else:
+            print("  OCR: disabled (set MONET_OCR=1 to enable)")
         
         self.weights = {
             'text': 0.25,
@@ -24,7 +30,14 @@ class SemanticAnalyzer:
             'context': 0.15
         }
     
+    def analyze_sync(self, frames):
+        """Synchronous wrapper for use inside worker threads."""
+        return self._run_analyze(frames)
+    
     async def analyze(self, frames: List[np.ndarray]) -> Tuple[float, str]:
+        return self._run_analyze(frames)
+    
+    def _run_analyze(self, frames):
         if len(frames) == 0:
             return 0.1, "No frames"
         

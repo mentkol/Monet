@@ -2,25 +2,30 @@
 import os
 import cv2
 import sys
+import argparse
 import asyncio
-import json
 import numpy as np
-import subprocess
-import tempfile
+import time
 import warnings
 from pathlib import Path
 
+# macOS fork safety (matches evaluate_model.py) - harmless on other platforms.
+os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
 # Silence protobuf deprecation warnings
 warnings.filterwarnings("ignore", message=".*SymbolDatabase.GetPrototype.*")
+
+# Bump when feature extraction changes (new features, frame sampling, resolution)
+# so stale cached features are recomputed instead of reused.
+FEATURE_CACHE_VERSION = "temporal4_8frame"
 
 # Add server directory to path so we can import analyzers
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from analyzers.texture import TextureAnalyzer
-from analyzers.biometrics import BiometricAnalyzer
 from analyzers.semantics import SemanticAnalyzer
 from analyzers.random_forest import RandomForestClassifier
-from analyzers.vit_detector import ViTDetector
+from analyzers.siglip_dinov2_detector import SigLIPDinoV2Detector
 
 # --- Helper functions duplicated from server.py to avoid import side-effects ---
 
@@ -114,271 +119,532 @@ def _analyze_metadata(metadata):
     hit_count = min(len(set(hits)), 6)
     return min(score, 0.85), hit_count / 6
 
-def _fetch_metadata(url):
-    try:
-        cmd = ["yt-dlp", "--dump-json", "--skip-download", url]
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        import json
-        raw = json.loads(result.stdout)
-        return {
-            "title": raw.get("title", ""),
-            "description": raw.get("description", ""),
-            "channel": raw.get("channel", "") or raw.get("uploader", ""),
-            "tags": raw.get("tags", []) or [],
-            "categories": raw.get("categories", []) or []
-        }
-    except Exception:
-        return {}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".flv"}
 
-def _feedback_label(correction):
-    mapping = {
-        "real": 0,
-        "suspicious": 1,
-        "ai": 2
-    }
-    return mapping.get((correction or "").lower())
 
-def _load_feedback_examples(base_dir):
-    feedback_path = os.path.join(base_dir, "training_data", "feedback.jsonl")
-    if not os.path.exists(feedback_path):
+def _is_video_file(path):
+    return os.path.isfile(path) and os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def _iter_video_files(folder):
+    """Return a sorted list of video file paths inside a folder (non-recursive)."""
+    if not os.path.isdir(folder):
         return []
+    entries = sorted(os.listdir(folder))
+    return [os.path.join(folder, name) for name in entries if _is_video_file(os.path.join(folder, name))]
 
-    examples = []
-    seen = set()
-    with open(feedback_path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
-            label = _feedback_label(row.get("correction"))
-            url = row.get("url")
-            if label is None or not url:
-                continue
+def _sample_frames(video_path, num_sample=8):
+    """Open a video file and sample up to `num_sample` frames evenly across the whole video.
 
-            key = (url, label, row.get("content_type"))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            metadata = row.get("metadata") or {}
-            content_type = row.get("content_type") or "feedback_uncategorized"
-            content_label = row.get("content_label") or content_type
-            examples.append({
-                "url": url,
-                "label": label,
-                "metadata": metadata,
-                "source": f"feedback:{content_label}",
-                "content_type": content_type
-            })
-
-    return examples
-
-async def _extract_training_features(url, label, analyzers, rf, metadata=None):
-    texture, biometrics, semantics, vit = analyzers
-    temp_path = None
-
-    if metadata is None:
-        metadata = _fetch_metadata(url)
+    Mirrors the inference path in server.py (linspace over frame indices) so
+    training and serving see the same frame distribution.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
 
     try:
-        fd, temp_path = tempfile.mkstemp(prefix="monet_train_", suffix=".mp4")
-        os.close(fd)
-
-        cmd = ["yt-dlp", "-f", "best[ext=mp4]", "-o", temp_path, "--force-overwrites", url]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-        cap = cv2.VideoCapture(temp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
         frames = []
         if total_frames > 0:
-            num_sample = min(12, total_frames)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            indices = [min(total_frames - 1, int(round(i * 0.5 * fps))) for i in range(num_sample)]
+            count = min(num_sample, total_frames)
+            indices = np.linspace(0, total_frames - 1, count, dtype=int)
+            indices = list(dict.fromkeys(int(i) for i in indices))
             for idx in indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = cap.read()
                 if ret:
                     frames.append(frame)
-
+        return frames
+    finally:
         cap.release()
 
-        if len(frames) < 1:
-            raise RuntimeError("No frames extracted")
 
-        t_scores = [texture.analyze(f)[0] for f in frames]
-        texture_mean = np.mean(t_scores)
-        texture_max = np.max(t_scores)
-        texture_std = np.std(t_scores)
+def _compute_temporal_features(frames):
+    """Frame-to-frame consistency features from a list of BGR frames.
 
-        b_scores = []
-        for f in frames:
-            s, _ = await biometrics.analyze(f)
-            b_scores.append(s)
+    Returns (temporal_diff_mean, temporal_diff_std, brightness_flicker, saturation_flicker).
+    Captures AI-video flicker / instability. Must match the helpers in server.py and
+    evaluate_model.py exactly so train and inference features line up.
+    """
+    if len(frames) < 2:
+        return 0.0, 0.0, 0.0, 0.0
 
-        if b_scores:
-            bio_mean = np.mean(b_scores)
-            bio_max = np.max(b_scores)
-            bio_std = np.std(b_scores)
-        else:
-            bio_mean = 0.0
-            bio_max = 0.0
-            bio_std = 0.0
+    diffs = []
+    brights = []
+    sats = []
+    for i, f in enumerate(frames):
+        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        brights.append(float(np.mean(gray)) / 255.0)
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        sats.append(float(np.mean(hsv[:, :, 1])) / 255.0)
+        if i > 0:
+            d = cv2.absdiff(f, frames[i - 1])
+            diffs.append(float(np.mean(d)) / 255.0)
 
-        color_scores = _analyze_color(frames)
-        color_mean = np.mean(color_scores)
-        color_max = np.max(color_scores)
-        color_std = np.std(color_scores)
+    return (
+        float(np.mean(diffs)),
+        float(np.std(diffs)),
+        float(np.std(brights)),
+        float(np.std(sats)),
+    )
 
-        digital_penalty = _detect_digital_content(frames[0])
-        semantic_score, _ = await semantics.analyze(frames)
-        vit_mean, vit_max, vit_std, _ = vit.analyze_frame_stats(frames)
-        metadata_score, metadata_hits = _analyze_metadata(metadata)
 
-        features = rf.extract_features(
-            texture_mean, texture_max, texture_std,
-            bio_mean, bio_max, bio_std,
-            color_mean, color_max, color_std,
-            digital_penalty,
-            semantic_score,
-            vit_max,
-            metadata_score=metadata_score,
-            metadata_hits=metadata_hits,
-            vit_mean=vit_mean,
-            vit_max=vit_max,
-            vit_std=vit_std
-        )
+async def _extract_features_from_video(video_path, label, analyzers, rf, metadata=None):
+    """Compute training features directly from a local video file (no download)."""
+    texture, semantics, vit = analyzers
 
-        summary = f"Bio={bio_mean:.2f}, ViT mean={vit_mean:.2f}, ViT max={vit_max:.2f}, ViT std={vit_std:.2f}, Label={label}"
-        return features[0], summary
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+    if metadata is None:
+        metadata = {}
 
+    frames = _sample_frames(video_path)
+    if len(frames) < 1:
+        raise RuntimeError("No frames extracted")
+
+    t_scores = [texture.analyze(f)[0] for f in frames]
+    texture_mean = np.mean(t_scores)
+    texture_max = np.max(t_scores)
+    texture_std = np.std(t_scores)
+
+    color_scores = _analyze_color(frames)
+    color_mean = np.mean(color_scores)
+    color_max = np.max(color_scores)
+    color_std = np.std(color_scores)
+
+    digital_penalty = _detect_digital_content(frames[0])
+    semantic_score, _ = await semantics.analyze(frames)
+    vit_mean, vit_max, vit_std, _ = vit.analyze_frame_stats(frames)
+    metadata_score, metadata_hits = _analyze_metadata(metadata)
+
+    (temporal_diff_mean, temporal_diff_std,
+     brightness_flicker, saturation_flicker) = _compute_temporal_features(frames)
+
+    features = rf.extract_features(
+        texture_mean, texture_max, texture_std,
+        color_mean, color_max, color_std,
+        digital_penalty,
+        semantic_score,
+        vit_max,
+        metadata_score=metadata_score,
+        metadata_hits=metadata_hits,
+        vit_mean=vit_mean,
+        vit_max=vit_max,
+        vit_std=vit_std,
+        temporal_diff_mean=temporal_diff_mean,
+        temporal_diff_std=temporal_diff_std,
+        brightness_flicker=brightness_flicker,
+        saturation_flicker=saturation_flicker,
+    )
+
+    summary = f"Detector mean={vit_mean:.2f}, Detector max={vit_max:.2f}, Detector std={vit_std:.2f}, Label={label}"
+    return features[0], summary
+
+
+
+def _fmt_dur(secs):
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+class ProgressTracker:
+    """Tracks success/failure counts and rolling ETA across the whole run."""
+
+    def __init__(self, total):
+        self.total = total
+        self.ok = 0
+        self.fail = 0
+        self.start = time.time()
+
+    @property
+    def processed(self):
+        return self.ok + self.fail
+
+    def status(self):
+        done = self.processed
+        elapsed = time.time() - self.start
+        if done == 0:
+            return f"OK={self.ok} FAIL={self.fail} | {_fmt_dur(elapsed)} elapsed"
+        remaining = max(0, self.total - done)
+        eta = elapsed / done * remaining
+        return f"OK={self.ok} FAIL={self.fail} | {_fmt_dur(elapsed)} elapsed, ~{_fmt_dur(eta)} ETA"
+
+
+def _train_binary(rf, X_arr, y_arr, base_dir):
+    """Train a binary 'AI vs not-AI' model.
+
+    The three UX buckets (LOW / MIXED / STRONG) are preserved, but 'Suspicious'
+    becomes a score band rather than a learned class. AI = class 2, everything
+    else = not-AI.
+    """
+    from sklearn.pipeline import Pipeline
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split, cross_val_score
+    from sklearn.ensemble import RandomForestClassifier as SKRandomForest
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import (confusion_matrix, f1_score, accuracy_score,
+                                 roc_auc_score, precision_score, recall_score)
+
+    y_bin = (y_arr == 2).astype(int)
+    counts = np.bincount(y_bin, minlength=2)
+    print(f"\nBinary labels -> not-AI={counts[0]}  AI={counts[1]}")
+
+    min_class = int(min(counts))
+    n_splits = max(2, min(5, min_class))
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    # ---- GridSearchCV (binary F1) ----
+    print("\nRunning GridSearchCV (binary, scoring=f1)...")
+    param_grid = {
+        'rf__n_estimators': [100, 200, 400],
+        'rf__max_depth': [None, 10, 20],
+        'rf__min_samples_split': [2, 5],
+        'rf__min_samples_leaf': [1, 2],
+    }
+    grid_pipe = Pipeline([('scaler', StandardScaler()),
+                          ('rf', SKRandomForest(random_state=42, class_weight='balanced'))])
+    grid = GridSearchCV(grid_pipe, param_grid, cv=cv, scoring='f1', n_jobs=1)
+    grid.fit(X_arr, y_bin)
+    best_params = {k.replace('rf__', ''): v for k, v in grid.best_params_.items()}
+    print(f"Best params : {best_params}")
+    print(f"Best CV f1  : {grid.best_score_:.3f}")
+
+    # ---- Honest CV with best params ----
+    print("\n--- Cross-Validation (binary) ---")
+    cv_rf_params = {**best_params, 'random_state': 42, 'class_weight': 'balanced'}
+    cv_pipe = Pipeline([('scaler', StandardScaler()), ('rf', SKRandomForest(**cv_rf_params))])
+    acc_cv = cross_val_score(cv_pipe, X_arr, y_bin, cv=cv, scoring='accuracy')
+    f1_cv = cross_val_score(cv_pipe, X_arr, y_bin, cv=cv, scoring='f1')
+    auc_cv = cross_val_score(cv_pipe, X_arr, y_bin, cv=cv, scoring='roc_auc')
+    print(f"  Accuracy : {acc_cv.mean():.3f} (+/- {acc_cv.std():.3f})")
+    print(f"  F1       : {f1_cv.mean():.3f} (+/- {f1_cv.std():.3f})")
+    print(f"  ROC-AUC  : {auc_cv.mean():.3f} (+/- {auc_cv.std():.3f})")
+
+    # ---- Held-out for reporting + threshold tuning ----
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_arr, y_bin, test_size=0.2, random_state=42, stratify=y_bin)
+    eval_rf = RandomForestClassifier()
+    eval_rf.use_evidence_floors = False
+    eval_rf.train(X_tr, y_tr, params=best_params, binary=True)
+
+    # ai_score per held-out sample (uses the same predict() path as the live server)
+    scores = [float(eval_rf.predict(np.array([row]))[0]) for row in X_te]
+
+    # Tune the AI decision threshold to maximize binary F1
+    best = None
+    for t in np.arange(0.30, 0.85, 0.01):
+        preds = [1 if s >= t else 0 for s in scores]
+        f1 = f1_score(y_te, preds, zero_division=0)
+        acc = accuracy_score(y_te, preds)
+        rec = recall_score(y_te, preds, zero_division=0)
+        prec = precision_score(y_te, preds, zero_division=0)
+        if best is None or f1 > best[0]:
+            best = (f1, float(t), acc, rec, prec)
+    tuned_f1, tuned_ai, tuned_acc, tuned_rec, tuned_prec = best
+    tuned_suspicious = max(0.10, tuned_ai - 0.20)
+
+    print(f"\n--- Held-out: BINARY (ai_threshold={tuned_ai:.2f}) ---")
+    preds = [1 if s >= tuned_ai else 0 for s in scores]
+    print("Confusion (rows=true [not-AI, AI], cols=pred):")
+    print(confusion_matrix(y_te, preds))
+    print(f"  Accuracy      : {tuned_acc:.3f}")
+    print(f"  AI recall     : {tuned_rec:.3f}")
+    print(f"  AI precision  : {tuned_prec:.3f}")
+    print(f"  F1            : {tuned_f1:.3f}")
+    in_band = sum(1 for s in scores if tuned_suspicious <= s < tuned_ai)
+    print(f"  Uncertain band [{tuned_suspicious:.2f}, {tuned_ai:.2f}): {in_band}/{len(scores)} samples")
+
+    print("\n--- Feature Importances ---")
+    importances = eval_rf.get_feature_importance()
+    if importances:
+        for name, imp in sorted(importances.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"  {name:<20} {imp:.4f} {'#' * int(imp * 100)}")
+
+    # ---- Train final model on ALL data and save (floors off, tuned thresholds) ----
+    rf.train(X_arr, y_bin, params=best_params, binary=True)
+    rf.use_evidence_floors = False
+    rf.ai_threshold = tuned_ai
+    rf.suspicious_threshold = tuned_suspicious
+    save_path = os.path.join(base_dir, "analyzers", "random_forest.pkl")
+    rf.save(save_path)
+
+    print("\n--- Summary ---")
+    print(f"  Binary CV accuracy : {acc_cv.mean():.3f}")
+    print(f"  Binary CV F1       : {f1_cv.mean():.3f}")
+    print(f"  Binary CV ROC-AUC  : {auc_cv.mean():.3f}")
+    print(f"  Held-out accuracy  : {tuned_acc:.3f}   (AI recall {tuned_rec:.3f}, precision {tuned_prec:.3f})")
+    print(f"\nSUCCESS! Binary model saved to: {save_path}")
+    print(f"  thresholds       : suspicious={rf.suspicious_threshold:.2f}  ai={rf.ai_threshold:.2f}")
+    print(f"  evidence_floors  : OFF")
+    print("Restart the server to load the new model.")
 
 
 async def main():
     print("="*60)
-    print("MONET: CUSTOM TRAINING (YouTube Pipeline)")
+    print("MONET: CUSTOM TRAINING (Local Video Pipeline)")
     print("="*60)
-    
+
     print("Initializing Analyzers...")
     texture = TextureAnalyzer()
-    biometrics = BiometricAnalyzer()
-    semantics = SemanticAnalyzer() 
-    vit = ViTDetector()
-    
+    semantics = SemanticAnalyzer()
+    vit = SigLIPDinoV2Detector()
+
     rf = RandomForestClassifier()
-    
+
+    parser = argparse.ArgumentParser(description="Train Monet AI-video detector on local videos.")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Cap videos per class (0 = all). e.g. --limit 20 for a quick smoke test.")
+    parser.add_argument("--force-extract", action="store_true",
+                        help="Ignore the feature cache and re-process every video.")
+    parser.add_argument("--binary", action="store_true",
+                        help="Train a binary 'AI vs not-AI' model (Suspicious becomes a score band).")
+    args = parser.parse_args()
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    label_names = {0: "Authentic", 1: "Suspicious", 2: "AI"}
     data_sources = [
-        (os.path.join(base_dir, 'training_data', 'urls_real.txt'), 0), 
-        (os.path.join(base_dir, 'training_data', 'urls_suspicious.txt'), 1),  
-        (os.path.join(base_dir, 'training_data', 'urls_fake.txt'), 2)       
+        (os.path.join(base_dir, 'training_data', 'urls_real'), 0),
+        (os.path.join(base_dir, 'training_data', 'urls_suspicious'), 1),
+        (os.path.join(base_dir, 'training_data', 'urls_fake'), 2),
     ]
-    
-    X = []
-    y = []
-    
-    total_videos = 0
-    
-    analyzers = (texture, biometrics, semantics, vit)
 
-    for url_file, label in data_sources:
-        if not os.path.exists(url_file):
-            print(f"Skipping {url_file} (Not found)")
-            continue
-            
-        with open(url_file, 'r') as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            
-        print(f"Found {len(urls)} videos in {url_file}")
-        total_videos += len(urls)
-        
-        for i, url in enumerate(urls):
-            print(f"[{i+1}/{len(urls)}] Processing: {url}")
-            try:
-                features, summary = await _extract_training_features(url, label, analyzers, rf)
-                X.append(features)
-                y.append(label)
-                print(f"  > Done. {summary}")
-            except Exception as e:
-                print(f"  > Failed: {e}")
-                import traceback
-                traceback.print_exc()
+    # ---- Resolve feature cache path (keyed on version + per-class limit) ----
+    cache_tag = f"limit{args.limit}" if args.limit and args.limit > 0 else "full"
+    cache_path = os.path.join(
+        base_dir, "training_data", f"features_v{FEATURE_CACHE_VERSION}_{cache_tag}.npz"
+    )
+
+    X, y = None, None
+    if os.path.exists(cache_path) and not args.force_extract:
+        try:
+            cached = np.load(cache_path, allow_pickle=True)
+            cached_version = str(cached['version'].item())
+            n_features = int(cached['X'].shape[1])
+            if cached_version == FEATURE_CACHE_VERSION and n_features == len(rf.FEATURE_NAMES):
+                X = cached['X'].tolist()
+                y = cached['y'].tolist()
+                print(f"\nLoaded cached features ({len(X)} samples, {n_features} features) from:")
+                print(f"  {cache_path}")
+                print("Run with --force-extract to ignore the cache and re-process videos.")
+            else:
+                print(f"\nCache mismatch (version {cached_version}/{FEATURE_CACHE_VERSION}, "
+                      f"features {n_features}/{len(rf.FEATURE_NAMES)}) - re-extracting.")
+        except Exception as e:
+            print(f"\nCache load failed ({e}) - re-extracting features.")
+
+    # ---- Extract features from videos if no usable cache ----
+    if X is None:
+        plan = []
+        total_videos = 0
+        for folder, label in data_sources:
+            video_files = _iter_video_files(folder)
+            if args.limit and args.limit > 0:
+                video_files = video_files[:args.limit]
+            plan.append((folder, label, video_files))
+            total_videos += len(video_files)
+
+        limit_note = f" (capped at {args.limit}/class)" if args.limit and args.limit > 0 else ""
+        print(f"\nTotal videos to process: {total_videos}{limit_note}")
+        progress = ProgressTracker(total_videos)
+
+        X, y = [], []
+        analyzers = (texture, semantics, vit)
+
+        for folder, label, video_files in plan:
+            label_name = label_names[label]
+            if not video_files:
+                print(f"\n[{label_name}] No videos in '{os.path.basename(folder)}/' - skipping")
                 continue
+            print(f"\n[{label_name}] {len(video_files)} local videos in '{os.path.basename(folder)}/'")
+            for i, video_path in enumerate(video_files):
+                print(f"[{label_name} {i+1}/{len(video_files)}] {os.path.basename(video_path)}")
+                try:
+                    features, summary = await _extract_features_from_video(
+                        video_path, label, analyzers, rf
+                    )
+                    X.append(features)
+                    y.append(label)
+                    progress.ok += 1
+                    print(f"  > OK  {summary} | {progress.status()}")
+                except Exception as e:
+                    progress.fail += 1
+                    print(f"  > FAIL {e} | {progress.status()}")
+                    continue
 
-    feedback_examples = _load_feedback_examples(base_dir)
-    if feedback_examples:
-        print(f"Found {len(feedback_examples)} categorized feedback examples")
-        for i, example in enumerate(feedback_examples):
-            label = example["label"]
-            print(f"[feedback {i+1}/{len(feedback_examples)}] {example['content_type']}: {example['url']}")
-            try:
-                features, summary = await _extract_training_features(
-                    example["url"],
-                    label,
-                    analyzers,
-                    rf,
-                    metadata=example.get("metadata")
-                )
-                X.append(features)
-                y.append(label)
-                print(f"  > Done. {summary}")
-            except Exception as e:
-                print(f"  > Feedback example failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+        if not X:
+            print("\nNo training data collected. Check that the video folders under training_data/ contain videos.")
+            return
 
-    if not X:
-        print("\nNo training data collected. Check URL files and internet connection.")
+        # Persist feature cache so later runs skip the expensive extraction.
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.savez(
+                cache_path,
+                X=np.array(X),
+                y=np.array(y),
+                version=np.array(FEATURE_CACHE_VERSION),
+                feature_names=np.array(",".join(rf.FEATURE_NAMES)),
+            )
+            print(f"\nFeatures cached to: {cache_path}")
+        except Exception as e:
+            print(f"\nFailed to write feature cache ({e}) - continuing anyway.")
+
+    X_arr = np.array(X)
+    y_arr = np.array(y)
+
+    print("\n" + "=" * 60)
+    mode = "BINARY (AI vs not-AI)" if args.binary else "3-CLASS (Auth/Susp/AI)"
+    print(f"STAGE 2: TRAINING [{mode}] (samples={len(y_arr)}, features={X_arr.shape[1]})")
+    print("=" * 60)
+
+    if args.binary:
+        _train_binary(rf, X_arr, y_arr, base_dir)
         return
 
-    print(f"\nTraining Model on {len(X)} samples...")
+    # Fallbacks if diagnostics cannot run (e.g. tiny smoke-test set)
+    best_params = None
+    tuned_suspicious = 0.32
+    tuned_ai = 0.58
+    best_use_floors = True
+
     try:
-        try:
-            from sklearn.metrics import classification_report, confusion_matrix
-            from sklearn.model_selection import train_test_split
+        from sklearn.pipeline import Pipeline
+        from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split, cross_val_score
+        from sklearn.ensemble import RandomForestClassifier as SKRandomForest
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import (classification_report, confusion_matrix, f1_score,
+                                     accuracy_score, roc_auc_score, precision_score, recall_score)
 
-            if len(set(y)) > 1 and min(np.bincount(np.array(y))) >= 2:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42, stratify=y
-                )
-                eval_rf = RandomForestClassifier()
-                eval_rf.train(X_train, y_train)
-                preds = []
-                for row in X_test:
-                    features = np.array([row])
-                    score, _, _, _ = eval_rf.predict(features)
-                    if score >= 0.58:
-                        preds.append(2)
-                    elif score >= 0.32:
-                        preds.append(1)
-                    else:
-                        preds.append(0)
+        min_class = int(min(np.bincount(y_arr)))
+        n_splits = max(2, min(5, min_class))
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-                print("\nHeld-out Evaluation:")
-                print(classification_report(
-                    y_test, preds,
-                    target_names=["Authentic", "Suspicious", "AI"],
-                    zero_division=0
-                ))
-                print("Confusion Matrix:")
-                print(confusion_matrix(y_test, preds))
-        except Exception as e:
-            print(f"Evaluation skipped: {e}")
+        # ---- GridSearchCV for hyperparameters (runs on cached features) ----
+        print("\nRunning GridSearchCV (scoring=f1-macro)...")
+        grid_pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('rf', SKRandomForest(random_state=42, class_weight='balanced')),
+        ])
+        param_grid = {
+            'rf__n_estimators': [100, 200, 400],
+            'rf__max_depth': [None, 10, 20],
+            'rf__min_samples_split': [2, 5],
+            'rf__min_samples_leaf': [1, 2],
+        }
+        grid = GridSearchCV(grid_pipe, param_grid, cv=cv, scoring='f1_macro', n_jobs=1)
+        grid.fit(X_arr, y_arr)
+        best_params = {k.replace('rf__', ''): v for k, v in grid.best_params_.items()}
+        print(f"Best params : {best_params}")
+        print(f"Best CV f1  : {grid.best_score_:.3f}")
 
-        rf.train(X, y)
-        
-        save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyzers", "random_forest.pkl")
-        rf.save(save_path)
-        print(f"SUCCESS! Model saved to: {save_path}")
-        print("Please restart the server to load the new model.")
+        # ---- Honest CV with best params ----
+        print("\n--- Cross-Validation (best params, raw RF) ---")
+        cv_rf_params = {**best_params, 'random_state': 42, 'class_weight': 'balanced'}
+        cv_pipe = Pipeline([('scaler', StandardScaler()), ('rf', SKRandomForest(**cv_rf_params))])
+        f1_cv = cross_val_score(cv_pipe, X_arr, y_arr, cv=cv, scoring='f1_macro')
+        acc_cv = cross_val_score(cv_pipe, X_arr, y_arr, cv=cv, scoring='accuracy')
+        print(f"  F1-macro : {f1_cv.mean():.3f} (+/- {f1_cv.std():.3f})  folds {[f'{s:.3f}' for s in f1_cv]}")
+        print(f"  Accuracy : {acc_cv.mean():.3f} (+/- {acc_cv.std():.3f})")
+
+        # ---- Held-out split for reporting + threshold tuning ----
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X_arr, y_arr, test_size=0.2, random_state=42, stratify=y_arr
+        )
+        eval_rf = RandomForestClassifier()
+        eval_rf.train(X_tr, y_tr, params=best_params)
+
+        # Raw RF predictions
+        print("\n--- Held-out: RAW RF MODEL ---")
+        raw_preds = eval_rf.model.predict(eval_rf.scaler.transform(X_te))
+        print(classification_report(y_te, raw_preds,
+                                    target_names=["Authentic", "Suspicious", "AI"], zero_division=0))
+        print("Confusion (rows=true, cols=pred):")
+        print(confusion_matrix(y_te, raw_preds))
+
+        # Compare heuristic pipeline with evidence floors ON vs OFF.
+        # Scores depend on the floors toggle, so we recompute per config and
+        # tune thresholds for each, then pick whichever has higher macro-F1.
+        def _eval_heuristic(name, scores):
+            print(f"\n--- Held-out: HEURISTIC {name} (default 0.32 / 0.58) ---")
+            def_preds = [2 if s >= 0.58 else (1 if s >= 0.32 else 0) for s in scores]
+            print(classification_report(y_te, def_preds,
+                                        target_names=["Authentic", "Suspicious", "AI"], zero_division=0))
+
+            best = None
+            for s_thr in np.arange(0.10, 0.55, 0.02):
+                for a_thr in np.arange(0.35, 0.85, 0.02):
+                    if s_thr >= a_thr:
+                        continue
+                    preds = [2 if s >= a_thr else (1 if s >= s_thr else 0) for s in scores]
+                    f1 = f1_score(y_te, preds, average='macro')
+                    acc = accuracy_score(y_te, preds)
+                    if best is None or f1 > best[0]:
+                        best = (f1, acc, float(s_thr), float(a_thr))
+            tf1, tacc, ts, ta = best
+
+            print(f"\n--- Held-out: HEURISTIC {name} (TUNED {ts:.2f} / {ta:.2f}) ---")
+            tuned_preds = [2 if s >= ta else (1 if s >= ts else 0) for s in scores]
+            print(classification_report(y_te, tuned_preds,
+                                        target_names=["Authentic", "Suspicious", "AI"], zero_division=0))
+            print("Confusion (rows=true, cols=pred):")
+            print(confusion_matrix(y_te, tuned_preds))
+            return tacc, tf1, ts, ta
+
+        results = {}
+        for fname, flag in [("FLOORS-ON", True), ("FLOORS-OFF", False)]:
+            eval_rf.use_evidence_floors = flag
+            scores = []
+            for row in X_te:
+                s, _, _, _ = eval_rf.predict(np.array([row]))
+                scores.append(float(s))
+            results[fname] = _eval_heuristic(fname, scores)
+
+        # Pick the better config by tuned macro-F1 (tie -> keep floors off, simpler)
+        on_f1 = results["FLOORS-ON"][1]
+        off_f1 = results["FLOORS-OFF"][1]
+        best_use_floors = on_f1 > off_f1
+        tuned_acc, tuned_f1, tuned_suspicious, tuned_ai = results[
+            "FLOORS-ON" if best_use_floors else "FLOORS-OFF"
+        ]
+
+        # Feature importances
+        print("\n--- Feature Importances ---")
+        importances = eval_rf.get_feature_importance()
+        if importances:
+            for name, imp in sorted(importances.items(), key=lambda kv: kv[1], reverse=True):
+                print(f"  {name:<20} {imp:.4f} {'#' * int(imp * 100)}")
+
+        # Summary
+        print("\n--- Summary ---")
+        print(f"  Raw RF accuracy        : {accuracy_score(y_te, raw_preds):.3f}")
+        print(f"  Raw RF f1-macro        : {f1_score(y_te, raw_preds, average='macro'):.3f}")
+        for fname in ["FLOORS-ON", "FLOORS-OFF"]:
+            tacc, tf1, ts, ta = results[fname]
+            tag = "  <== chosen" if (fname == "FLOORS-ON") == best_use_floors else ""
+            print(f"  {fname:<10} tuned acc/f1 : {tacc:.3f} / {tf1:.3f}  (thr {ts:.2f}/{ta:.2f}){tag}")
+        print(f"  Chosen thresholds      : suspicious={tuned_suspicious:.2f}  ai={tuned_ai:.2f}  "
+              f"evidence_floors={'ON' if best_use_floors else 'OFF'}")
     except Exception as e:
-        print(f"Training failed: {e}")
+        import traceback
+        print(f"\nDiagnostic/tuning skipped: {e}")
+        traceback.print_exc()
+
+    # ---- Train final model on ALL data and save (with tuned thresholds) ----
+    rf.train(X_arr, y_arr, params=best_params)
+    rf.suspicious_threshold = tuned_suspicious
+    rf.ai_threshold = tuned_ai
+    rf.use_evidence_floors = best_use_floors
+    save_path = os.path.join(base_dir, "analyzers", "random_forest.pkl")
+    rf.save(save_path)
+    print(f"\nSUCCESS! Model saved to: {save_path}")
+    print(f"  thresholds       : suspicious={rf.suspicious_threshold:.2f}  ai={rf.ai_threshold:.2f}")
+    print(f"  evidence_floors  : {'ON' if rf.use_evidence_floors else 'OFF'}")
+    print("Restart the server to load the new model.")
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -35,6 +35,10 @@ venv
 ENV
 
 # Large models / Cached models
-server/models/vit_onnx/
-server/models/*.onnx
-*.onnx
+server/models/siglip_dinov2/
+server/models/*/
+
+# Training Data
+urls_fake/
+urls_real/
+urls_suspicious/

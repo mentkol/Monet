@@ -3,12 +3,20 @@ import os, sys, warnings
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+# Cap PyTorch CPU threads so parallel analyzer threads (texture/semantics via
+# OpenCV) have room on the machine. Tunable via MONET_TORCH_THREADS.
+try:
+    import torch as _torch
+    _default_torch_threads = max(1, (os.cpu_count() or 8) - 3)
+    _torch.set_num_threads(int(os.environ.get("MONET_TORCH_THREADS", _default_torch_threads)))
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore", message=".*SymbolDatabase.GetPrototype.*")
 warnings.filterwarnings("ignore", message=".*Mean of empty slice.*")
 warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
 warnings.filterwarnings("ignore", message=".*use_fast.*")
 warnings.filterwarnings("ignore", message=".*slow image processor.*")
-warnings.filterwarnings("ignore", message=".*ViTFeatureExtractor is deprecated.*")
 warnings.filterwarnings("ignore", message=".*Non-default generation parameters.*")
 
 try:
@@ -20,6 +28,7 @@ except Exception:
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import json
 import numpy as np
 from PIL import Image
@@ -31,10 +40,9 @@ import time
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from analyzers.texture import TextureAnalyzer
-from analyzers.biometrics import BiometricAnalyzer
 from analyzers.semantics import SemanticAnalyzer
 from analyzers.random_forest import RandomForestClassifier
-from analyzers.vit_detector import ViTDetector
+from analyzers.siglip_dinov2_detector import SigLIPDinoV2Detector
 
 try:
     os.dup2(save_stderr, 2)
@@ -166,11 +174,10 @@ class MonetAnalyzer:
             return module
 
         self.texture = load_module("Texture", lambda: TextureAnalyzer())
-        self.biometrics = load_module("Biometrics", lambda: BiometricAnalyzer())
         self.semantics = load_module("Semantics", lambda: SemanticAnalyzer())
         
         self.impossible_classifier = ImpossibleSceneClassifier()
-        self.vit_detector = load_module("ViT Model", lambda: ViTDetector(), lambda m: m.loaded)
+        self.ai_detector = load_module("AI Detector", lambda: SigLIPDinoV2Detector(), lambda m: m.loaded)
         
         model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyzers", "random_forest.pkl")
         self.rf_classifier = load_module("RF Model", lambda: RandomForestClassifier(model_path=model_path), lambda m: m.is_trained)
@@ -208,6 +215,26 @@ class MonetAnalyzer:
             else:
                 scores.append(0.1)
         return scores
+
+    def _compute_temporal_features(self, frames):
+        """Frame-to-frame consistency features (must match train_model.py / evaluate_model.py)."""
+        if len(frames) < 2:
+            return 0.0, 0.0, 0.0, 0.0
+        diffs, brights, sats = [], [], []
+        for i, f in enumerate(frames):
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            brights.append(float(np.mean(gray)) / 255.0)
+            hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+            sats.append(float(np.mean(hsv[:, :, 1])) / 255.0)
+            if i > 0:
+                d = cv2.absdiff(f, frames[i - 1])
+                diffs.append(float(np.mean(d)) / 255.0)
+        return (
+            float(np.mean(diffs)),
+            float(np.std(diffs)),
+            float(np.std(brights)),
+            float(np.std(sats)),
+        )
 
     def _analyze_metadata(self, metadata):
         if not isinstance(metadata, dict):
@@ -299,43 +326,50 @@ class MonetAnalyzer:
             return {"error": "No frames received"}
         
         start = time.time()
-        key_indices = np.linspace(0, len(frames) - 1, min(8, len(frames)), dtype=int)
-        key_indices = list(dict.fromkeys(int(i) for i in key_indices))
-        key_frames = [frames[i] for i in key_indices]
-        
-        texture_results = [self.texture.analyze(frame) for frame in key_frames]
-        texture_scores = [score for score, _ in texture_results]
-        texture_mean = np.mean(texture_scores)
-        texture_max = np.max(texture_scores)
-        texture_std = np.std(texture_scores)
-        texture_descs = [desc for _, desc in texture_results]
-        
-        bio_results = []
-        for frame in key_frames:
-            bio_results.append(await self.biometrics.analyze(frame))
-        bio_scores = [score for score, _ in bio_results]
-        bio_mean = np.mean(bio_scores)
-        bio_max = np.max(bio_scores)
-        bio_std = np.std(bio_scores)
-        bio_descs = [desc for _, desc in bio_results]
-        
+        texture_n = min(4, len(frames))
+        texture_indices = np.linspace(0, len(frames) - 1, texture_n, dtype=int)
+        texture_indices = list(dict.fromkeys(int(i) for i in texture_indices))
+        texture_frames = [frames[i] for i in texture_indices]
+
+        async def _texture_job():
+            def _work():
+                texture_results = [self.texture.analyze(frame) for frame in texture_frames]
+                texture_scores = [score for score, _ in texture_results]
+                return (
+                    float(np.mean(texture_scores)),
+                    float(np.max(texture_scores)),
+                    float(np.std(texture_scores)),
+                    [desc for _, desc in texture_results],
+                )
+            return await asyncio.to_thread(_work)
+
+        async def _semantics_job():
+            return await asyncio.to_thread(lambda: self.semantics.analyze_sync(frames))
+
+        async def _detector_job():
+            return await asyncio.to_thread(lambda: self.ai_detector.analyze_frame_stats(frames))
+
+        (texture_mean, texture_max, texture_std, texture_descs), \
+            (semantic_score, semantic_desc), \
+            (vit_mean, vit_max, vit_std, vit_desc) = await asyncio.gather(
+                _texture_job(), _semantics_job(), _detector_job()
+            )
+        vit_score = vit_max
+
         color_scores = self._analyze_color(frames)
         color_mean = np.mean(color_scores)
         color_max = np.max(color_scores)
         color_std = np.std(color_scores)
         
         digital_penalty, digital_desc = self._detect_digital_content(frames[0])
-        
-        semantic_score, semantic_desc = await self.semantics.analyze(frames)
-        
-        vit_mean, vit_max, vit_std, vit_desc = self.vit_detector.analyze_frame_stats(frames)
-        vit_score = vit_max
 
         metadata_score, metadata_hits, metadata_desc = self._analyze_metadata(metadata)
-        
+
+        (temporal_diff_mean, temporal_diff_std,
+         brightness_flicker, saturation_flicker) = self._compute_temporal_features(texture_frames)
+
         features = self.rf_classifier.extract_features(
             texture_mean, texture_max, texture_std,
-            bio_mean, bio_max, bio_std,
             color_mean, color_max, color_std,
             digital_penalty,
             semantic_score,
@@ -344,7 +378,11 @@ class MonetAnalyzer:
             metadata_hits=metadata_hits,
             vit_mean=vit_mean,
             vit_max=vit_max,
-            vit_std=vit_std
+            vit_std=vit_std,
+            temporal_diff_mean=temporal_diff_mean,
+            temporal_diff_std=temporal_diff_std,
+            brightness_flicker=brightness_flicker,
+            saturation_flicker=saturation_flicker,
         )
         
         final_score, label, color, rf_confidence = self.rf_classifier.predict(features)
@@ -356,24 +394,23 @@ class MonetAnalyzer:
             color = "#ef4444"
         
         rf_says_ai = final_score >= 0.50
-        vit_says_ai = vit_score >= 0.50
+        detector_says_ai = vit_score >= 0.50
         rf_says_real = final_score < 0.28
-        vit_says_real = vit_score < 0.20
+        detector_says_real = vit_score < 0.20
         
         if youtube_disclosure_override:
             confidence_level = "High"
-        elif (rf_says_ai and vit_says_ai) or (rf_says_real and vit_says_real):
+        elif (rf_says_ai and detector_says_ai) or (rf_says_real and detector_says_real):
             confidence_level = "High"
-        elif rf_says_ai != vit_says_ai and abs(final_score - 0.5) < 0.15:
+        elif rf_says_ai != detector_says_ai and abs(final_score - 0.5) < 0.15:
             confidence_level = "Low"
         else:
             confidence_level = "Medium"
         
         score_reasons = [
-            (bio_mean, bio_descs[-1] if bio_descs else "N/A", "Biometrics"),
             (texture_mean, texture_descs[-1], "Texture"),
             (semantic_score, semantic_desc, "Semantics"),
-            (vit_score, vit_desc, "ViT"),
+            (vit_score, vit_desc, "AI Detector"),
             (metadata_score, metadata_desc, "Metadata")
         ]
         
@@ -422,12 +459,6 @@ class MonetAnalyzer:
                     "std": round(s(texture_std), 2),
                     "desc": texture_descs[-1]
                 },
-                "biometric": {
-                    "score": round(s(bio_mean), 2), 
-                    "max": round(s(bio_max), 2),
-                    "std": round(s(bio_std), 2),
-                    "desc": bio_descs[-1] if bio_descs else "N/A"
-                },
                 "color": {
                     "score": round(s(color_mean), 2),
                     "max": round(s(color_max), 2),
@@ -437,7 +468,7 @@ class MonetAnalyzer:
                     "score": round(s(semantic_score), 2),
                     "desc": semantic_desc
                 },
-                "vit": {
+                "ai_detector": {
                     "score": round(s(vit_score), 2),
                     "mean": round(s(vit_mean), 2),
                     "std": round(s(vit_std), 2),
@@ -454,28 +485,6 @@ class MonetAnalyzer:
                 }
             }
         }
-
-def save_feedback(data):
-    feedback_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_data")
-    os.makedirs(feedback_dir, exist_ok=True)
-    feedback_path = os.path.join(feedback_dir, "feedback.jsonl")
-    record = {
-        "created_at": int(time.time()),
-        "videoId": data.get("videoId"),
-        "correction": data.get("correction"),
-        "content_type": data.get("contentType"),
-        "content_label": data.get("contentLabel"),
-        "score": data.get("score"),
-        "label": data.get("label"),
-        "confidence": data.get("confidence"),
-        "reason": data.get("reason"),
-        "breakdown": data.get("breakdown", {}),
-        "url": data.get("url"),
-        "src": data.get("src"),
-        "metadata": data.get("metadata", {})
-    }
-    with open(feedback_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 analyzer = MonetAnalyzer()
 
@@ -540,16 +549,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             })
                         except:
                             break
-                elif data.get("type") == "feedback":
-                    save_feedback(data)
-                    try:
-                        await websocket.send_json({
-                            "type": "feedback_saved",
-                            "videoId": data.get("videoId")
-                        })
-                    except:
-                        break
-                            
+
             except WebSocketDisconnect:
                 sys.stdout.write("\033[1m\033[91m")
                 for char in "Extension disconnected":
