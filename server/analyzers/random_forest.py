@@ -21,8 +21,8 @@ class RandomForestClassifier:
         self.scaler = StandardScaler()
         self.model = None
         self.is_trained = False
-        self.ai_threshold = 0.58
-        self.suspicious_threshold = 0.32
+        self.ai_threshold = 0.65
+        self.suspicious_threshold = 0.46
         self.use_evidence_floors = True
         self.is_binary = False
         
@@ -73,6 +73,9 @@ class RandomForestClassifier:
         return len(self.FEATURE_NAMES)
 
     def _manual_score(self, features, rf_score=0.0):
+        """Hand-tuned weighted blend of all signals (the detector dominates).
+        Boosted when several signals agree, then reduced by the digital penalty
+        so flat/digital frames don't read as AI."""
         texture = features[0, 0]
         color_score = features[0, 3]
         digital_penalty = features[0, 6]
@@ -110,6 +113,8 @@ class RandomForestClassifier:
         return min(max(ai_score, 0.0), 1.0)
 
     def _apply_evidence_floors(self, features, ai_score):
+        """Optional safety floors: raise the score when one signal is very
+        strong (so it can't be buried), and cap it for obvious digital content."""
         texture = features[0, 0]
         semantic = features[0, 7]
         vit_mean = features[0, 8] if features.shape[1] > 8 else 0.0
@@ -131,7 +136,7 @@ class RandomForestClassifier:
             ai_score = max(ai_score, 0.56)
 
         if metadata_score >= 0.70:
-            ai_score = max(ai_score, 0.58)
+            ai_score = max(ai_score, self.ai_threshold)
         elif metadata_score >= 0.35 and vit_max >= 0.45:
             ai_score = max(ai_score, 0.55)
 
@@ -139,8 +144,11 @@ class RandomForestClassifier:
             ai_score = min(ai_score, 0.49)
 
         return min(max(ai_score, 0.0), 1.0)
-    
+
     def predict(self, features):
+        """Produce the final 0-1 AI score. Blends the manual score with the
+        Random Forest probability, applies optional floors, then maps the
+        score to a label/colour using the band thresholds."""
         if not self.is_trained:
             raise RuntimeError("Model not trained. Call train() first.")
         expected_features = self._expected_feature_count()
@@ -189,6 +197,7 @@ class RandomForestClassifier:
         return ai_score, label, color, rf_confidence
     
     def train(self, X, y, params=None, binary=False):
+        """Fit the Random Forest on the feature matrix X with labels y."""
         X = np.array(X)
         y = np.array(y)
 
@@ -237,8 +246,8 @@ class RandomForestClassifier:
         self.scaler = data['scaler']
         self.is_trained = data['is_trained']
         self.feature_names = data.get('feature_names', self.FEATURE_NAMES[:self._expected_feature_count()])
-        self.ai_threshold = data.get('ai_threshold', 0.58)
-        self.suspicious_threshold = data.get('suspicious_threshold', 0.32)
+        # Always use the band thresholds defined in __init__, ignoring any older
+        # values saved in the .pkl, so the labels always match the current code.
         self.use_evidence_floors = data.get('use_evidence_floors', True)
         self.is_binary = data.get('is_binary', False)
         print(f"Model loaded from {path}")

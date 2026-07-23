@@ -41,8 +41,13 @@ FEATURE_NAMES = [
 # stale cached features are recomputed instead of reused.
 CACHE_VERSION = "8frame_480p_temporal4"
 
+# Must match train_model.FEATURE_CACHE_VERSION. This is the .npz feature cache
+# that train_model.py writes; evaluate_model.py prefers it so evaluation never
+# has to re-extract features from the source videos.
+FEATURE_CACHE_VERSION = "temporal4_8frame"
 
-def score_to_class(score, ai_threshold=0.58, suspicious_threshold=0.32):
+
+def score_to_class(score, ai_threshold=0.65, suspicious_threshold=0.46):
     if score >= ai_threshold:
         return 2
     if score >= suspicious_threshold:
@@ -73,6 +78,28 @@ def load_sources(base_dir, limit_per_class=None):
                 "source": folder_name + "/",
             })
     return examples
+
+
+def load_feature_cache(base_dir, cache_tag="full"):
+    """Load the .npz feature cache written by train_model.py.
+
+    Returns (X, y, cache_path). X/y are None if no usable cache exists
+    (missing file, version mismatch, or feature-count mismatch).
+    """
+    cache_path = os.path.join(
+        base_dir, "training_data", f"features_v{FEATURE_CACHE_VERSION}_{cache_tag}.npz"
+    )
+    if not os.path.exists(cache_path):
+        return None, None, cache_path
+    try:
+        cached = np.load(cache_path, allow_pickle=True)
+        version = str(cached["version"].item())
+        n_features = int(cached["X"].shape[1])
+        if version != FEATURE_CACHE_VERSION or n_features != len(FEATURE_NAMES):
+            return None, None, cache_path
+        return cached["X"], cached["y"], cache_path
+    except Exception:
+        return None, None, cache_path
 
 
 def _detect_digital_content(img):
@@ -330,8 +357,8 @@ def class_metrics(rows):
 
 def threshold_sweep(scored_rows):
     candidates = []
-    for suspicious_threshold in [0.25, 0.28, 0.30, 0.32, 0.35, 0.40, 0.45]:
-        for ai_threshold in [0.50, 0.55, 0.58, 0.60, 0.65, 0.70]:
+    for suspicious_threshold in [0.38, 0.42, 0.44, 0.46, 0.48, 0.50, 0.54]:
+        for ai_threshold in [0.55, 0.60, 0.63, 0.65, 0.67, 0.70]:
             if suspicious_threshold >= ai_threshold:
                 continue
             rows = []
@@ -460,72 +487,244 @@ def write_report(path, rows, sweep, feature_importance):
         f.write("\n".join(lines) + "\n")
 
 
+# Binary evaluation: real + suspicious are merged into "not-AI", so the model
+# is scored on the AI-vs-not-AI task it was trained for. The middle display band
+# is treated as "uncertain", never as an error.
+
+def _actual_binary(actual):
+    """Map 3-class ground truth (0=real, 1=suspicious, 2=AI) -> binary (0=not-AI, 1=AI)."""
+    return 1 if actual == 2 else 0
+
+
+def binary_metrics(rows, threshold):
+    tp = fp = tn = fn = 0
+    for r in rows:
+        actual = _actual_binary(r["actual"])
+        predicted = 1 if r["score"] >= threshold else 0
+        if predicted and actual:
+            tp += 1
+        elif predicted and not actual:
+            fp += 1
+        elif not predicted and not actual:
+            tn += 1
+        else:
+            fn += 1
+    total = tp + fp + tn + fn
+    accuracy = (tp + tn) / total if total else 0.0
+    ai_prec = tp / (tp + fp) if (tp + fp) else 0.0
+    ai_rec = tp / (tp + fn) if (tp + fn) else 0.0
+    ai_f1 = 2 * ai_prec * ai_rec / (ai_prec + ai_rec) if (ai_prec + ai_rec) else 0.0
+    notai_prec = tn / (tn + fn) if (tn + fn) else 0.0
+    notai_rec = tn / (tn + fp) if (tn + fp) else 0.0
+    return {
+        "threshold": threshold,
+        "accuracy": accuracy,
+        "ai_precision": ai_prec,
+        "ai_recall": ai_rec,
+        "ai_f1": ai_f1,
+        "notai_precision": notai_prec,
+        "notai_recall": notai_rec,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "support_ai": tp + fn,
+        "support_notai": tn + fp,
+    }
+
+
+def binary_threshold_sweep(rows):
+    candidates = []
+    for t in [0.40, 0.45, 0.50, 0.52, 0.55, 0.58, 0.60, 0.63, 0.65, 0.68, 0.70, 0.75, 0.80, 0.84]:
+        candidates.append(binary_metrics(rows, t))
+    return candidates
+
+
+def write_binary_report(path, rows, sweep, feature_importance, deployed_threshold, uncertain_lo, uncertain_hi):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    deployed = binary_metrics(rows, deployed_threshold)
+
+    false_positives = [r for r in rows if _actual_binary(r["actual"]) == 0 and r["score"] >= deployed_threshold]
+    false_negatives = [r for r in rows if _actual_binary(r["actual"]) == 1 and r["score"] < deployed_threshold]
+    uncertain = [r for r in rows if uncertain_lo <= r["score"] < uncertain_hi]
+
+    lines = [
+        "# Monet Classification Evaluation (BINARY: AI vs not-AI)",
+        "",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "Real + Suspicious are merged into 'not-AI'. The score band "
+        f"[{uncertain_lo:.2f}, {uncertain_hi:.2f}) is the display 'Suspicious' zone "
+        "(reported as uncertain, never as an error).",
+        f"Examples evaluated: {len(rows)} (not-AI={deployed['support_notai']}, AI={deployed['support_ai']})",
+        f"AI decision threshold: score >= {deployed_threshold}",
+        "",
+        "## Deployed-threshold metrics",
+        "",
+        f"- Accuracy: {deployed['accuracy']:.1%}",
+        f"- AI precision: {deployed['ai_precision']:.1%}",
+        f"- AI recall: {deployed['ai_recall']:.1%}",
+        f"- AI F1: {deployed['ai_f1']:.1%}",
+        f"- not-AI precision: {deployed['notai_precision']:.1%}",
+        f"- not-AI recall: {deployed['notai_recall']:.1%}",
+        f"- Uncertain band [{uncertain_lo:.2f}, {uncertain_hi:.2f}): {len(uncertain)} examples",
+        "",
+        "## Confusion matrix (rows=true, cols=pred)",
+        "```",
+        "           not-AI    AI",
+        f"  not-AI  {deployed['tn']:>6}  {deployed['fp']:>4}",
+        f"  AI      {deployed['fn']:>6}  {deployed['tp']:>4}",
+        "```",
+        "",
+        "## Threshold sweep",
+        "",
+        "| Threshold | Accuracy | AI Precision | AI Recall | AI F1 | not-AI Recall |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in sweep:
+        lines.append(
+            f"| {row['threshold']:.2f} | {row['accuracy']:.1%} | {row['ai_precision']:.1%} | "
+            f"{row['ai_recall']:.1%} | {row['ai_f1']:.1%} | {row['notai_recall']:.1%} |"
+        )
+
+    lines.extend(["", "## Feature Importance", ""])
+    if feature_importance:
+        for name, importance in sorted(feature_importance.items(), key=lambda item: item[1], reverse=True):
+            lines.append(f"- {name}: {importance:.3f}")
+    else:
+        lines.append("- Feature importance unavailable until the model is trained with matching features.")
+
+    lines.extend(["", "## False Positives (not-AI flagged as AI)", ""])
+    if false_positives:
+        for row in false_positives[:25]:
+            lines.append(f"- {row['url']} | score {row['score']:.3f}")
+    else:
+        lines.append("- None.")
+
+    lines.extend(["", "## False Negatives (AI missed)", ""])
+    if false_negatives:
+        for row in false_negatives[:25]:
+            lines.append(f"- {row['url']} | score {row['score']:.3f}")
+    else:
+        lines.append("- None.")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Evaluate Monet on local labeled videos.")
     parser.add_argument("--limit-per-class", type=int, default=None, help="Quick-run limit for each class.")
-    parser.add_argument("--cache", default=None, help="Feature cache JSONL path.")
+    parser.add_argument("--cache", default=None, help="Feature cache JSONL path (only used with --force-extract).")
     parser.add_argument("--report", default=None, help="Markdown report output path.")
+    parser.add_argument("--force-extract", action="store_true",
+                        help="Ignore the .npz feature cache and re-extract features from the source videos.")
+    parser.add_argument("--cache-tag", default=None,
+                        help="Feature-cache tag to load (default 'full', or 'limit<N>' matching train_model --limit).")
+    parser.add_argument("--binary", action="store_true",
+                        help="Evaluate as binary AI-vs-not-AI (merge real+suspicious into not-AI).")
     args = parser.parse_args()
 
     from analyzers.random_forest import RandomForestClassifier
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    cache_path = args.cache or os.path.join(base_dir, "training_data", "feature_cache.jsonl")
     report_path = args.report or os.path.join(base_dir, "training_data", "evaluation_report.md")
     model_path = os.path.join(base_dir, "analyzers", "random_forest.pkl")
 
-    examples = load_sources(base_dir, args.limit_per_class)
-
-    if not examples:
-        print("No examples found.")
-        return
-
-    cache = load_cache(cache_path)
-    extractor = FeatureExtractor()
     model = RandomForestClassifier(model_path=model_path)
 
+    cache_tag = args.cache_tag or (f"limit{args.limit_per_class}" if args.limit_per_class else "full")
+    bucket_for_label = {0: "real", 1: "suspicious", 2: "ai"}
+
     rows = []
-    for idx, example in enumerate(examples, start=1):
-        url = example["url"]
-        print(f"[{idx}/{len(examples)}] {url}")
-        try:
-            cached = cache.get(url)
-            if cached and cached.get("v") == CACHE_VERSION and len(cached.get("features", [])) == len(FEATURE_NAMES):
-                feature_row = cached
-            else:
-                feature_row = await extractor.extract(example)
-                feature_row.update({"url": url, "v": CACHE_VERSION})
-                append_cache(cache_path, feature_row)
 
-            features = np.array([feature_row["features"]])
-            score, _, _, confidence = model.predict(features)
-            predicted = score_to_class(score)
+    # ---- Prefer the .npz feature cache produced by train_model.py ----
+    if not args.force_extract:
+        X, y, npz_path = load_feature_cache(base_dir, cache_tag)
+        if X is not None:
+            print(f"Loaded feature cache ({len(y)} samples, {X.shape[1]} features) from:")
+            print(f"  {npz_path}")
+            print("(Use --force-extract to re-extract from the source videos instead.)\n")
+            for i in range(len(y)):
+                features = np.array([X[i]])
+                score, _, _, confidence = model.predict(features)
+                rows.append({
+                    "url": f"cache/{i}",
+                    "actual": int(y[i]),
+                    "predicted": score_to_class(score),
+                    "score": float(score),
+                    "confidence": float(confidence),
+                    "bucket": bucket_for_label.get(int(y[i]), "unknown"),
+                    "source": "feature_cache.npz",
+                    "signals": {},
+                })
+        else:
+            print(f"No usable .npz feature cache for tag '{cache_tag}'; falling back to video extraction.\n")
 
-            rows.append({
-                "url": url,
-                "actual": example["label"],
-                "predicted": predicted,
-                "score": float(score),
-                "confidence": float(confidence),
-                "bucket": example["bucket"],
-                "source": example["source"],
-                "signals": feature_row.get("signals", {}),
-            })
-        except Exception as e:
-            print(f"  skipped: {e}")
+    # ---- Fallback: extract features from the source videos ----
+    if not rows:
+        cache_path = args.cache or os.path.join(base_dir, "training_data", "feature_cache.jsonl")
+        examples = load_sources(base_dir, args.limit_per_class)
+        if not examples:
+            print("No examples found.")
+            return
+
+        cache = load_cache(cache_path)
+        extractor = FeatureExtractor()
+
+        for idx, example in enumerate(examples, start=1):
+            url = example["url"]
+            print(f"[{idx}/{len(examples)}] {url}")
+            try:
+                cached = cache.get(url)
+                if cached and cached.get("v") == CACHE_VERSION and len(cached.get("features", [])) == len(FEATURE_NAMES):
+                    feature_row = cached
+                else:
+                    feature_row = await extractor.extract(example)
+                    feature_row.update({"url": url, "v": CACHE_VERSION})
+                    append_cache(cache_path, feature_row)
+
+                features = np.array([feature_row["features"]])
+                score, _, _, confidence = model.predict(features)
+                predicted = score_to_class(score)
+
+                rows.append({
+                    "url": url,
+                    "actual": example["label"],
+                    "predicted": predicted,
+                    "score": float(score),
+                    "confidence": float(confidence),
+                    "bucket": example["bucket"],
+                    "source": example["source"],
+                    "signals": feature_row.get("signals", {}),
+                })
+            except Exception as e:
+                print(f"  skipped: {e}")
 
     if not rows:
         print("No examples could be evaluated.")
         return
 
-    sweep = threshold_sweep(rows)
-    write_report(report_path, rows, sweep, model.get_feature_importance())
+    if args.binary:
+        deployed_threshold = model.ai_threshold
+        sweep = binary_threshold_sweep(rows)
+        write_binary_report(
+            report_path, rows, sweep, model.get_feature_importance(),
+            deployed_threshold, model.suspicious_threshold, model.ai_threshold,
+        )
+        deployed = binary_metrics(rows, deployed_threshold)
+        print(f"\nBinary evaluation (AI vs not-AI) — threshold {deployed_threshold}")
+        print(f"  Examples     : {len(rows)} (not-AI={deployed['support_notai']}, AI={deployed['support_ai']})")
+        print(f"  Accuracy     : {deployed['accuracy']:.1%}")
+        print(f"  AI precision : {deployed['ai_precision']:.1%}")
+        print(f"  AI recall    : {deployed['ai_recall']:.1%}")
+        print(f"  AI F1        : {deployed['ai_f1']:.1%}")
+        print(f"Report saved to: {report_path}")
+    else:
+        sweep = threshold_sweep(rows)
+        write_report(report_path, rows, sweep, model.get_feature_importance())
 
-    accuracy, metrics = class_metrics(rows)
-    print(f"\nEvaluated {len(rows)} examples")
-    print(f"Accuracy: {accuracy:.1%}")
-    print(f"AI recall: {metrics[2]['recall']:.1%}")
-    print(f"Report saved to: {report_path}")
+        accuracy, metrics = class_metrics(rows)
+        print(f"\nEvaluated {len(rows)} examples")
+        print(f"Accuracy: {accuracy:.1%}")
+        print(f"AI recall: {metrics[2]['recall']:.1%}")
+        print(f"Report saved to: {report_path}")
 
 
 if __name__ == "__main__":

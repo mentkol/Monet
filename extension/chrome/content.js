@@ -554,14 +554,14 @@ const Monet = {
         let color, glowAnim, labelText, labelBg;
 
         // High AI evidence
-        if (score >= 0.58) {
+        if (score >= 0.65) {
             color = 'rgba(239, 68, 68, 1.0)';
             glowAnim = 'monet-glow-red';
             labelText = 'Likely AI';
             labelBg = 'rgba(220, 38, 38, 0.85)';
         }
         // Mixed AI evidence
-        else if (score >= 0.32) {
+        else if (score >= 0.46) {
             color = 'rgba(249, 115, 22, 1.0)';
             glowAnim = 'monet-glow-orange';
             labelText = 'Suspicious';
@@ -612,8 +612,8 @@ const Monet = {
         let breakdownHtml = `<div class="monet-breakdown-header">Analysis Breakdown</div>`;
 
         const getScoreColor = (val) => {
-            if (val >= 0.6) return '#ef4444'; // Red
-            if (val >= 0.35) return '#f97316'; // Orange
+            if (val >= 0.65) return '#ef4444'; // Red
+            if (val >= 0.46) return '#f97316'; // Orange
             return '#22c55e'; // Green
         };
 
@@ -624,7 +624,7 @@ const Monet = {
                 'semantic': 'Semantics',
                 'ai_detector': 'AI Detector',
                 'metadata': 'Metadata / YouTube AI Label',
-                'digital_penalty': 'Digital Media Penalty'
+                'digital_penalty': 'Digital/Animated Content'
             };
             if (dictionary[key]) return dictionary[key];
             return key.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');

@@ -306,12 +306,7 @@ class SigLIPDinoV2Detector:
 
             ai_prob = float(torch.sigmoid(logits).item())
 
-            if ai_prob >= 0.7:
-                desc = f"AI Detector: {ai_prob:.0%} AI"
-            elif ai_prob >= 0.4:
-                desc = f"AI Detector: {ai_prob:.0%} possibly AI"
-            else:
-                desc = f"AI Detector: {ai_prob:.0%} likely authentic"
+            desc = self._desc_for_prob(ai_prob)
 
             return ai_prob, desc
 
@@ -321,12 +316,12 @@ class SigLIPDinoV2Detector:
 
     @staticmethod
     def _desc_for_prob(ai_prob):
-        if ai_prob >= 0.7:
-            return f"AI Detector: {ai_prob:.0%} AI"
-        elif ai_prob >= 0.4:
-            return f"AI Detector: {ai_prob:.0%} possibly AI"
+        if ai_prob >= 0.65:
+            return f"{ai_prob:.0%} AI"
+        elif ai_prob >= 0.46:
+            return f"{ai_prob:.0%} possibly AI"
         else:
-            return f"AI Detector: {ai_prob:.0%} likely authentic"
+            return f"{ai_prob:.0%} likely authentic"
 
     def _score_frames_batched(self, frames, batch_size=None):
         """Score a list of BGR frames in batches (one forward pass per batch).

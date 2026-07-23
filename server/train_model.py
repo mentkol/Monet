@@ -27,7 +27,8 @@ from analyzers.semantics import SemanticAnalyzer
 from analyzers.random_forest import RandomForestClassifier
 from analyzers.siglip_dinov2_detector import SigLIPDinoV2Detector
 
-# --- Helper functions duplicated from server.py to avoid import side-effects ---
+# Helper functions copied from server.py (kept local so this script can run
+# without importing the server, which has heavy side-effects).
 
 def _detect_digital_content(img):
     """Detect games/screen recordings to reduce false positives"""
@@ -508,8 +509,8 @@ async def main():
 
     # Fallbacks if diagnostics cannot run (e.g. tiny smoke-test set)
     best_params = None
-    tuned_suspicious = 0.32
-    tuned_ai = 0.58
+    tuned_suspicious = 0.46
+    tuned_ai = 0.65
     best_use_floors = True
 
     try:
@@ -570,8 +571,8 @@ async def main():
         # Scores depend on the floors toggle, so we recompute per config and
         # tune thresholds for each, then pick whichever has higher macro-F1.
         def _eval_heuristic(name, scores):
-            print(f"\n--- Held-out: HEURISTIC {name} (default 0.32 / 0.58) ---")
-            def_preds = [2 if s >= 0.58 else (1 if s >= 0.32 else 0) for s in scores]
+            print(f"\n--- Held-out: HEURISTIC {name} (default 0.46 / 0.65) ---")
+            def_preds = [2 if s >= 0.65 else (1 if s >= 0.46 else 0) for s in scores]
             print(classification_report(y_te, def_preds,
                                         target_names=["Authentic", "Suspicious", "AI"], zero_division=0))
 

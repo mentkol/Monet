@@ -427,9 +427,9 @@ class MonetAnalyzer:
             
         elapsed = int((time.time() - start) * 1000)
         
-        if final_score >= 0.58:
+        if final_score >= 0.65:
             term_color = '\033[91m'
-        elif final_score >= 0.32:
+        elif final_score >= 0.46:
             term_color = '\033[93m'
         else:
             term_color = '\033[92m'

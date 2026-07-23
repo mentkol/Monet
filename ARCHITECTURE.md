@@ -84,8 +84,8 @@ This is the life of a single analysis, step by step.
 ### Back on the extension
 
 12. `onmessage` looks up the border by `videoId`, then `updateColor()`:
-    - picks a color/label by the score band (red "Likely AI" ≥0.58, orange
-      "Suspicious" ≥0.32, green "Low AI" <0.32),
+    - picks a color/label by the score band (red "Likely AI" ≥0.65, orange
+      "Suspicious" ≥0.46, green "Low AI" <0.46),
     - sets an animated glowing border,
     - renders the floating label (`"73% Likely AI"`),
     - builds a **breakdown popup** (texture, color, semantics, detector,
@@ -330,9 +330,12 @@ digital penalty then *reduces* it: `ai = weighted·(1 − digital_penalty·0.5)`
 
 ### Step D — Evidence floors (`_apply_evidence_floors`)
 Hard minimums so strong individual signals can't be buried:
+- **Detector authority:** `vit_max ≥ ai_threshold` → score ≥ `vit_max`
+  (the dedicated detector is the strongest signal, so the headline never
+  contradicts it); `vit_max ≥ suspicious_threshold` → ≥ `suspicious_threshold`.
 - `vit_mean ≥ 0.55` → score ≥ 0.60.
 - `vit_max ≥ 0.70` with a corroborating signal → ≥ 0.60.
-- `metadata ≥ 0.70` → ≥ 0.58.
+- `metadata ≥ 0.70` → ≥ `ai_threshold`.
 - Conversely, high digital penalty + low vit/metadata *caps* the score at
   0.49 (digital cartoons shouldn't read as AI).
 
@@ -343,9 +346,9 @@ Hard minimums so strong individual signals can't be buried:
 ### Step F — Label + color
 | Score | Label | Color |
 |---|---|---|
-| ≥ 0.58 | STRONG AI EVIDENCE | red `#ef4444` |
-| ≥ 0.32 | MIXED AI EVIDENCE | orange `#f97316` |
-| < 0.32 | LOW AI EVIDENCE | green `#22c55e` |
+| ≥ 0.65 | STRONG AI EVIDENCE | red `#ef4444` |
+| ≥ 0.46 | MIXED AI EVIDENCE | orange `#f97316` |
+| < 0.46 | LOW AI EVIDENCE | green `#22c55e` |
 
 ### Step G — Confidence level
 A separate human-readable certainty, based on **agreement** between the RF
@@ -381,7 +384,7 @@ features).
   per-class caps (`--limit`).
 
 **Threshold tuning:**
-The default decision thresholds (AI 0.58, suspicious 0.32) aren't fixed —
+The default decision thresholds (AI 0.65, suspicious 0.46) aren't fixed —
 `train_model.py` / `evaluate_model.py` sweep candidate thresholds and pick the
 pair that maximizes a target metric (accuracy/F1) on the validation set, then
 store them inside the `.pkl` (`rf.ai_threshold`, `rf.suspicious_threshold`).
