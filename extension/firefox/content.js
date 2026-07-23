@@ -178,13 +178,35 @@ const Monet = {
 
     // Check if a video needs analysis and trigger it
     tryAnalyze(video) {
-        const result = this.videoResults.get(video);
+        let result = this.videoResults.get(video);
+        // If the element is now playing different content (e.g. after navigating
+        // from one video to another on the same reused <video>), drop the stale
+        // cache so we re-analyze instead of showing the previous score.
+        if (this._contentChanged(video, result)) {
+            this.resetVideo(video);
+            result = undefined;
+        }
         // Already analyzed — keep border
         if (result && result.analyzed) return;
         // Currently analyzing — don't double-send
         if (result && result.borderId && !result.analyzed) return;
         // Analyze after brief delay for frames to stabilize
         setTimeout(() => this.analyze(video), 300);
+    },
+
+    // Has the content of this <video> changed since we cached a result for it?
+    // YouTube streams via MSE blob URLs that can be reused across different
+    // videos, so src alone is unreliable; we also compare the page URL and the
+    // media duration.
+    _contentChanged(video, cached) {
+        if (!cached) return false;
+        if (cached.url && cached.url !== location.href) return true;
+        const currentSrc = video.currentSrc || video.src;
+        if (currentSrc && cached.src && cached.src !== currentSrc) return true;
+        const dur = video.duration;
+        if (isFinite(dur) && dur > 0 && cached.duration !== undefined &&
+            Math.abs(dur - cached.duration) > 1) return true;
+        return false;
     },
 
     watchVideos() {
@@ -195,11 +217,10 @@ const Monet = {
             }
 
             document.querySelectorAll('video').forEach(video => {
-                const currentSrc = video.currentSrc || video.src;
-
-                // Check if this video's source changed (new video loaded in same element)
+                // Detect when YouTube reuses a <video> element for new content
+                // (src/blob URL alone is unreliable — see _contentChanged).
                 const cached = this.videoResults.get(video);
-                if (cached && cached.src && currentSrc && cached.src !== currentSrc) {
+                if (this._contentChanged(video, cached)) {
                     this.resetVideo(video);
                     // Re-analyze after scroll animation settles
                     setTimeout(() => this.tryAnalyze(video), 800);
@@ -246,16 +267,6 @@ const Monet = {
                 }
             }
         }, 10000);
-    },
-
-    // Reset everything (used on URL change)
-    resetAll() {
-        document.querySelectorAll('video').forEach(video => {
-            this.resetVideo(video);
-            video.monetChecked = false;
-        });
-        this.borders.clear();
-        this.videoResults.clear();
     },
 
     // Reset a single video's overlay and cached result
@@ -482,6 +493,8 @@ const Monet = {
             });
             this.videoResults.set(video, {
                 src: video.currentSrc || video.src,
+                url: location.href,
+                duration: isFinite(video.duration) ? video.duration : undefined,
                 borderId: id,
                 score: 1.0,
                 reason: 'YouTube AI disclosure detected: ' + metadata.youtubeAiDisclosure,
@@ -503,6 +516,8 @@ const Monet = {
         // Cache video info for persistence
         this.videoResults.set(video, {
             src: video.currentSrc || video.src,
+            url: location.href,
+            duration: isFinite(video.duration) ? video.duration : undefined,
             borderId: id,
             score: null,
             reason: null,

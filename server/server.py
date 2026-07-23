@@ -488,27 +488,49 @@ class MonetAnalyzer:
 
 analyzer = MonetAnalyzer()
 
+# Number of currently-open extension WebSocket connections. The connect /
+# disconnect banners are only printed on the 0->1 and 1->0 transitions so that
+# multiple tabs (or a transient double-connect) don't produce duplicate
+# "Extension connected/disconnected" lines.
+_active_ws_connections = 0
+
+_banner_lock = None
+
+async def _typewrite(text, color_prefix, delay=0.02):
+    """Typewriter-print one colored line for the connect/disconnect banner.
+    Serialized with a lock so a fast reconnect can't overlap two animations and
+    garble them (the original cause of the 'EEEEE...xtension' output)."""
+    global _banner_lock
+    if _banner_lock is None:
+        _banner_lock = asyncio.Lock()
+    async with _banner_lock:
+        sys.stdout.write(color_prefix)
+        sys.stdout.flush()
+        for char in text:
+            sys.stdout.write(char)
+            sys.stdout.flush()
+            await asyncio.sleep(delay)
+        sys.stdout.write("\033[0m\n")
+        sys.stdout.flush()
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    import asyncio
+    global _active_ws_connections
     await websocket.accept()
-    
-    if hasattr(analyzer, "waiting_spinner") and analyzer.waiting_spinner:
-        analyzer.waiting_spinner.terminate()
-        analyzer.waiting_spinner.wait()
-        sys.stdout.write("\r\033[1m\033[92m")
-        analyzer.waiting_spinner = None
-    else:
-        sys.stdout.write("\033[1m\033[92m")
-        
-    sys.stdout.flush()
-    
-    for char in "Extension connected                          ":
-        sys.stdout.write(char)
+
+    _active_ws_connections += 1
+    # Only announce / stop the spinner for the FIRST active connection.
+    if _active_ws_connections == 1:
+        if hasattr(analyzer, "waiting_spinner") and analyzer.waiting_spinner:
+            analyzer.waiting_spinner.terminate()
+            analyzer.waiting_spinner.wait()
+            analyzer.waiting_spinner = None
+        # Clear the spinner's line fully: the spinner text ("Ready & Waiting for
+        # extension") is longer than the banner, so a bare '\r' left trailing
+        # chars behind (e.g. "...or extension").
+        sys.stdout.write("\r\033[K")
         sys.stdout.flush()
-        await asyncio.sleep(0.02)
-    sys.stdout.write("\033[0m\n")
-    sys.stdout.flush()
+        await _typewrite("Extension connected", "\033[1m\033[92m")
     
     try:
         while True:
@@ -551,13 +573,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
 
             except WebSocketDisconnect:
-                sys.stdout.write("\033[1m\033[91m")
-                for char in "Extension disconnected":
-                    sys.stdout.write(char)
-                    sys.stdout.flush()
-                    await asyncio.sleep(0.02)
-                sys.stdout.write("\033[0m\n")
-                sys.stdout.flush()
                 break
             except json.JSONDecodeError:
                 print("Invalid JSON")
@@ -573,6 +588,10 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+        _active_ws_connections -= 1
+        # Only announce when the LAST active connection drops.
+        if _active_ws_connections == 0:
+            await _typewrite("Extension disconnected", "\033[1m\033[91m")
 
 if __name__ == "__main__":
     import uvicorn
