@@ -36,7 +36,7 @@ def _detect_digital_content(img):
     unique_colors = len(np.unique(pixels, axis=0))
     total_pixels = img.shape[0] * img.shape[1]
     diversity_ratio = unique_colors / total_pixels
-    
+
     if diversity_ratio < 0.05:
         return 0.3 #Digital content detected
     elif diversity_ratio < 0.15:

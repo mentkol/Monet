@@ -25,7 +25,7 @@ class RandomForestClassifier:
         self.suspicious_threshold = 0.46
         self.use_evidence_floors = True
         self.is_binary = False
-        
+
         if model_path and os.path.exists(model_path):
             try:
                 self.load(model_path)
@@ -33,7 +33,7 @@ class RandomForestClassifier:
                 print("Failed to load model.")
         else:
             print("No trained model found. Please run training script.")
-        
+
         print("Random Forest classifier loaded")
 
     def extract_features(self, texture_mean, texture_max, texture_std,
@@ -62,7 +62,7 @@ class RandomForestClassifier:
             temporal_diff_mean, temporal_diff_std,
             brightness_flicker, saturation_flicker,
         ]])
-        
+
         return features
 
     def _expected_feature_count(self):
@@ -183,7 +183,7 @@ class RandomForestClassifier:
             ai_score = self._apply_evidence_floors(features, ai_score)
 
         ai_score = min(max(ai_score, 0.0), 1.0)
-        
+
         if ai_score >= self.ai_threshold:
             label = "STRONG AI EVIDENCE"
             color = "#ef4444"
@@ -193,9 +193,9 @@ class RandomForestClassifier:
         else:
             label = "LOW AI EVIDENCE"
             color = "#22c55e"
-        
+
         return ai_score, label, color, rf_confidence
-    
+
     def train(self, X, y, params=None, binary=False):
         """Fit the Random Forest on the feature matrix X with labels y."""
         X = np.array(X)
@@ -223,7 +223,7 @@ class RandomForestClassifier:
 
         mode = "BINARY (AI vs not-AI)" if binary else "3-class"
         print(f"Model trained on {len(y)} samples [{mode}]")
-    
+
     def save(self, path):
         data = {
             'model': self.model,
@@ -238,7 +238,7 @@ class RandomForestClassifier:
         with open(path, 'wb') as f:
             pickle.dump(data, f)
         print(f"Model saved to {path}")
-    
+
     def load(self, path):
         with open(path, 'rb') as f:
             data = pickle.load(f)
@@ -251,12 +251,12 @@ class RandomForestClassifier:
         self.use_evidence_floors = data.get('use_evidence_floors', True)
         self.is_binary = data.get('is_binary', False)
         print(f"Model loaded from {path}")
-    
+
     def get_feature_importance(self):
         if not self.is_trained:
             return None
-        
+
         feature_names = getattr(self, 'feature_names', self.FEATURE_NAMES)
         importances = self.model.feature_importances_
-        
+
         return dict(zip(feature_names, importances))
